@@ -1404,6 +1404,56 @@ func (q *Queries) ListWorkflowAttempts(ctx context.Context, arg ListWorkflowAtte
 	return items, nil
 }
 
+const listWorkflowContextItemSummaries = `-- name: ListWorkflowContextItemSummaries :many
+SELECT reference_key, kind, title, source_type, source_id, source_digest
+FROM workflow_context_item
+WHERE snapshot_id = $1 AND workspace_id = $2
+ORDER BY ordinal
+`
+
+type ListWorkflowContextItemSummariesParams struct {
+	SnapshotID  pgtype.UUID `json:"snapshot_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+type ListWorkflowContextItemSummariesRow struct {
+	ReferenceKey string      `json:"reference_key"`
+	Kind         string      `json:"kind"`
+	Title        string      `json:"title"`
+	SourceType   string      `json:"source_type"`
+	SourceID     pgtype.UUID `json:"source_id"`
+	SourceDigest string      `json:"source_digest"`
+}
+
+// Keep the catalog path content-free: selecting content/search_text here turns
+// a small manifest request into a full-context transfer.
+func (q *Queries) ListWorkflowContextItemSummaries(ctx context.Context, arg ListWorkflowContextItemSummariesParams) ([]ListWorkflowContextItemSummariesRow, error) {
+	rows, err := q.db.Query(ctx, listWorkflowContextItemSummaries, arg.SnapshotID, arg.WorkspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListWorkflowContextItemSummariesRow{}
+	for rows.Next() {
+		var i ListWorkflowContextItemSummariesRow
+		if err := rows.Scan(
+			&i.ReferenceKey,
+			&i.Kind,
+			&i.Title,
+			&i.SourceType,
+			&i.SourceID,
+			&i.SourceDigest,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWorkflowContextItems = `-- name: ListWorkflowContextItems :many
 SELECT id, workspace_id, snapshot_id, ordinal, reference_key, kind, title, content, search_text, source_type, source_id, source_digest, created_at FROM workflow_context_item
 WHERE snapshot_id = $1 AND workspace_id = $2

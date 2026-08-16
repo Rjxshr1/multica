@@ -163,6 +163,14 @@ SELECT * FROM workflow_context_item
 WHERE snapshot_id = @snapshot_id AND workspace_id = @workspace_id
 ORDER BY ordinal;
 
+-- name: ListWorkflowContextItemSummaries :many
+-- Keep the catalog path content-free: selecting content/search_text here turns
+-- a small manifest request into a full-context transfer.
+SELECT reference_key, kind, title, source_type, source_id, source_digest
+FROM workflow_context_item
+WHERE snapshot_id = @snapshot_id AND workspace_id = @workspace_id
+ORDER BY ordinal;
+
 -- name: GetWorkflowContextBootstrapItems :many
 SELECT * FROM workflow_context_item
 WHERE snapshot_id = @snapshot_id AND workspace_id = @workspace_id

@@ -244,7 +244,7 @@ func (s *WorkflowRuntimeService) ContextCatalog(ctx context.Context, workspaceID
 	if err != nil {
 		return nil, err
 	}
-	items, err := s.Queries.ListWorkflowContextItems(ctx, db.ListWorkflowContextItemsParams{SnapshotID: snapshot.ID, WorkspaceID: workspaceID})
+	items, err := s.Queries.ListWorkflowContextItemSummaries(ctx, db.ListWorkflowContextItemSummariesParams{SnapshotID: snapshot.ID, WorkspaceID: workspaceID})
 	if err != nil {
 		return nil, err
 	}
@@ -319,14 +319,17 @@ func (s *WorkflowRuntimeService) GetContextItem(ctx context.Context, workspaceID
 	return &view, nil
 }
 
-func contextCatalog(snapshot db.WorkflowContextSnapshot, items []db.WorkflowContextItem) *WorkflowContextCatalog {
+func contextCatalog(snapshot db.WorkflowContextSnapshot, items []db.ListWorkflowContextItemSummariesRow) *WorkflowContextCatalog {
 	catalog := &WorkflowContextCatalog{
 		SnapshotID: util.UUIDToString(snapshot.ID), RunID: util.UUIDToString(snapshot.RunID), NodeID: util.UUIDToString(snapshot.NodeID),
 		AttemptID: util.UUIDToString(snapshot.AttemptID), ContextRevision: snapshot.RunRevision, SourceDigest: snapshot.Digest,
 		Items: make([]WorkflowContextItemSummary, 0, len(items)),
 	}
 	for _, item := range items {
-		catalog.Items = append(catalog.Items, contextItemSummary(item))
+		catalog.Items = append(catalog.Items, WorkflowContextItemSummary{
+			ReferenceKey: item.ReferenceKey, Kind: item.Kind, Title: item.Title,
+			SourceType: item.SourceType, SourceID: util.UUIDToString(item.SourceID), SourceDigest: item.SourceDigest,
+		})
 	}
 	return catalog
 }

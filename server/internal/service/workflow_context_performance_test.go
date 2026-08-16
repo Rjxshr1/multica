@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -117,6 +118,25 @@ func TestWorkflowContextPerformanceAB(t *testing.T) {
 	}
 	raw, _ := json.Marshal(result)
 	fmt.Printf("CONTEXT_BENCHMARK_JSON=%s\n", raw)
+}
+
+func TestContextCatalogBuildsFromSummaryRows(t *testing.T) {
+	snapshot := db.WorkflowContextSnapshot{
+		ID: newPGUUID(), RunID: newPGUUID(), NodeID: newPGUUID(), AttemptID: newPGUUID(),
+		RunRevision: 7, Digest: "snapshot-digest",
+	}
+	sourceID := newPGUUID()
+	catalog := contextCatalog(snapshot, []db.ListWorkflowContextItemSummariesRow{{
+		ReferenceKey: "event/42", Kind: "event", Title: "verification passed",
+		SourceType: "workflow_event", SourceID: sourceID, SourceDigest: "item-digest",
+	}})
+	if len(catalog.Items) != 1 {
+		t.Fatalf("catalog items = %d, want 1", len(catalog.Items))
+	}
+	item := catalog.Items[0]
+	if item.ReferenceKey != "event/42" || item.SourceID != util.UUIDToString(sourceID) || item.SourceDigest != "item-digest" {
+		t.Fatalf("catalog item = %+v", item)
+	}
 }
 
 func measureContextOperation(t *testing.T, iterations int, operation func() any) contextPerformanceMetric {
