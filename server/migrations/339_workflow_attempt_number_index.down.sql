@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS workflow_attempt_node_number_uidx;

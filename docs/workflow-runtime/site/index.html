@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Multica Workflow Studio Runtime</title>
+  <style>
+    :root{--bg:#090b11;--panel:#111520;--line:#252b39;--text:#f5f7fb;--muted:#99a3b7;--green:#5ee0a0;--amber:#ffc568;--red:#ff707a;--blue:#82aaff}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 70% -20%,#17213c 0,transparent 36%),var(--bg);color:var(--text);font:15px/1.6 Inter,ui-sans-serif,system-ui,-apple-system,"PingFang SC",sans-serif}.wrap{max-width:1080px;margin:auto;padding:58px 24px 80px}a{color:var(--blue)}.eyebrow{color:var(--green);font-weight:700;letter-spacing:.12em;text-transform:uppercase}h1{font-size:clamp(36px,7vw,72px);line-height:1.02;letter-spacing:-.055em;margin:13px 0 22px;max-width:900px}h2{font-size:25px;margin:0 0 18px;letter-spacing:-.025em}.lead{font-size:19px;color:#c8cede;max-width:780px}.badges{display:flex;gap:10px;flex-wrap:wrap;margin:28px 0 45px}.badge{border:1px solid var(--line);background:#111722;padding:7px 12px;border-radius:999px}.ok{color:var(--green)}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}.card{grid-column:span 4;background:linear-gradient(150deg,#151a27,#0f131c);border:1px solid var(--line);border-radius:18px;padding:22px}.wide{grid-column:span 8}.full{grid-column:1/-1}.kicker{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em}.big{font-size:42px;font-weight:750;letter-spacing:-.04em}.muted{color:var(--muted)}.architecture{display:grid;grid-template-columns:1fr 42px 1fr 42px 1fr;align-items:stretch;gap:8px}.layer{border:1px solid var(--line);border-radius:14px;padding:18px;background:#0d1119}.arrow{display:grid;place-items:center;color:#68728a;font-size:22px}.layer b{display:block;margin-bottom:7px}.layer span{color:var(--muted)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px 10px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:12px;text-transform:uppercase}.meter{height:8px;border-radius:10px;background:#272d39;overflow:hidden;margin-top:8px}.meter i{display:block;height:100%;background:var(--green)}.legacy i{background:var(--red)}button{border:0;border-radius:10px;padding:11px 16px;background:var(--green);color:#06120b;font-weight:750;cursor:pointer}button.secondary{background:#222938;color:var(--text)}.trace{margin-top:18px;display:grid;gap:8px}.step{opacity:.28;border-left:2px solid #343b4b;padding:8px 12px;transition:.25s}.step.active{opacity:1;border-color:var(--amber);background:#171b25}.step.done{opacity:1;border-color:var(--green)}.step strong{display:inline-block;min-width:120px}.state{font:13px ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--muted)}pre{white-space:pre-wrap;background:#080a0f;border:1px solid var(--line);border-radius:12px;padding:15px;color:#d8deec;overflow:auto}.foot{margin-top:30px;color:var(--muted);font-size:13px}@media(max-width:800px){.card,.wide{grid-column:1/-1}.architecture{grid-template-columns:1fr}.arrow{transform:rotate(90deg)}}
+  </style>
+</head>
+<body><main class="wrap">
+  <div class="eyebrow">Workflow Studio / Runtime Core</div>
+  <h1>任务不再“说完成就完成”，而是验证通过才推进。</h1>
+  <p class="lead">这次改造从 Multica 底层增加权威 Workflow Runtime：Task 只提交结果，独立 Verification 决定 Node，失败自动生成新 Attempt，旧回调被 fence 拒绝。</p>
+  <div class="badges"><span class="badge ok">✓ 真实 PostgreSQL loop 已通过</span><span class="badge ok">✓ TaskService 事务接入</span><span class="badge ok">✓ Outbox 可恢复投递</span></div>
+
+  <section class="grid">
+    <article class="card"><div class="kicker">改造前</div><div class="big" style="color:var(--red)">20%</div><div class="muted">受控故障注入基准：重复回调、重启、验证失败、旧回调会破坏循环。</div><div class="meter legacy"><i style="width:20%"></i></div></article>
+    <article class="card"><div class="kicker">改造后</div><div class="big ok">100%</div><div class="muted">同一组 100 / 1000 次确定性场景全部完成。</div><div class="meter"><i style="width:100%"></i></div></article>
+    <article class="card"><div class="kicker">数据口径</div><div class="big">5 类</div><div class="muted">happy path / duplicate / restart / verification retry / stale callback。不是生产遥测。</div></article>
+
+    <article class="card full"><h2>架构只有三层</h2><div class="architecture">
+      <div class="layer"><b>Workflow Studio（上层）</b><span>定义 DAG、Prompt、Agent、验收策略、人工 Gate 和业务补救。</span></div><div class="arrow">→</div>
+      <div class="layer"><b>Workflow Runtime（Multica 底层）</b><span>Run / Node / Attempt、CAS、Fence、Verification、Retry、Event + Outbox。</span></div><div class="arrow">→</div>
+      <div class="layer"><b>Task / Runtime（原能力复用）</b><span>排队、机器分发、执行、心跳与恢复；不裁决业务成功。</span></div>
+    </div></article>
+
+    <article class="card wide"><h2>亲眼看一次真实状态循环</h2><p class="muted">这里按已通过的数据库集成测试播放同一条状态轨迹。</p><button id="run">运行 Loop</button><button id="reset" class="secondary">重置</button><div class="trace" id="trace">
+      <div class="step"><strong>Attempt 1</strong><span class="state">task completed → verifying</span></div>
+      <div class="step"><strong>独立验证</strong><span class="state">code_defect → rejected</span></div>
+      <div class="step"><strong>Attempt 2</strong><span class="state">fence 1 → 2, stale callback rejected</span></div>
+      <div class="step"><strong>重新执行</strong><span class="state">task completed → verifying</span></div>
+      <div class="step"><strong>验证通过</strong><span class="state">implement succeeded → deliver ready</span></div>
+      <div class="step"><strong>最终结果</strong><span class="state">workflow succeeded</span></div>
+    </div></article>
+    <article class="card"><h2>为什么稳定</h2><p><b>一致性：</b>run lock + node revision CAS。</p><p><b>防旧结果：</b>active attempt + 单调 fence。</p><p><b>不丢事件：</b>状态、Event、Outbox 同一事务。</p><p><b>只有一个重试者：</b>Workflow task 的 max_attempts=1，重试由 Runtime 负责。</p></article>
+
+    <article class="card full"><h2>你自己验证</h2><p class="muted">在 Windows PowerShell 运行；脚本会创建隔离的临时 PostgreSQL 容器，完成后自动删除。</p><pre id="command">wsl.exe -d Ubuntu --cd /home/ai/codex-work/multica-workflow-runtime -- bash scripts/verify-workflow-runtime.sh</pre><button class="secondary" id="copy">复制命令</button></article>
+  </section>
+  <p class="foot">代码：<a href="https://github.com/Rjxshr1/multica/tree/feat/workflow-runtime-loop">github.com/Rjxshr1/multica</a> · 基准数据为确定性故障注入参考，不冒充线上生产成功率。</p>
+</main><script>
+const steps=[...document.querySelectorAll('.step')];let timer;
+function reset(){clearInterval(timer);steps.forEach(x=>x.className='step')}
+document.querySelector('#reset').onclick=reset;
+document.querySelector('#run').onclick=()=>{reset();let i=0;steps[0].classList.add('active');timer=setInterval(()=>{steps[i].classList.remove('active');steps[i].classList.add('done');i++;if(i===steps.length){clearInterval(timer);return}steps[i].classList.add('active')},650)};
+document.querySelector('#copy').onclick=async e=>{await navigator.clipboard.writeText(document.querySelector('#command').textContent);e.target.textContent='已复制 ✓';setTimeout(()=>e.target.textContent='复制命令',1400)};
+</script></body></html>

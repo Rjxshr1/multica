@@ -163,6 +163,8 @@ type Handler struct {
 	DaemonWorkspaceRefresh WorkspaceSetRefreshNotifier
 	Bus                    *events.Bus
 	TaskService            *service.TaskService
+	WorkflowRuntime        *service.WorkflowRuntimeService
+	WorkflowOutbox         *service.WorkflowOutboxWorker
 	PluginService          *service.PluginService
 	IssueService           *service.IssueService
 	AutopilotService       *service.AutopilotService
@@ -371,6 +373,8 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 	})
 
 	taskSvc := service.NewTaskService(queries, txStarter, hub, bus, daemonHub)
+	workflowRuntime := service.NewWorkflowRuntimeService(queries, txStarter)
+	taskSvc.WorkflowRuntime = workflowRuntime
 	taskSvc.Analytics = analyticsClient
 	// Chat follow-up suggestions run through the same internal LLM layer that
 	// backs auto-titling. A deployment with no MULTICA_LLM_* configuration gets
@@ -386,6 +390,8 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		DaemonWorkspaceRefresh:       daemonWorkspaceRefresh,
 		Bus:                          bus,
 		TaskService:                  taskSvc,
+		WorkflowRuntime:              workflowRuntime,
+		WorkflowOutbox:               service.NewWorkflowOutboxWorker(queries, bus),
 		PluginService:                service.NewPluginService(queries, txStarter),
 		IssueService:                 service.NewIssueService(queries, txStarter, bus, analyticsClient, taskSvc),
 		AutopilotService:             service.NewAutopilotService(queries, txStarter, bus, taskSvc),

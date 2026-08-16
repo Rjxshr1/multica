@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS workflow_verification_run_idempotency_uidx;

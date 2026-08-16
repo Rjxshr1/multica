@@ -1211,6 +1211,10 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			run:  func() error { return qtx.DeleteChatPinnedAgentsByWorkspace(ctx, requester.WorkspaceID) },
 		},
 		{
+			name: "delete workflow runtime",
+			run:  func() error { return qtx.DeleteWorkspaceWorkflowRuntime(ctx, requester.WorkspaceID) },
+		},
+		{
 			// This is the first stage that touches usage rollups. Keep the
 			// global rollup lock out of relationship preparation so unrelated
 			// workspaces skip the shortest possible rollup window. This wait

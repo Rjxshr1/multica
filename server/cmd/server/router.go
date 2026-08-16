@@ -1162,6 +1162,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				r.Group(func(r chi.Router) {
 					r.Use(middleware.RequireWorkspaceMemberFromURL(queries, "id"))
 					r.Get("/", h.GetWorkspace)
+					// Workflow Studio control plane. Execution callbacks remain task-scoped;
+					// these routes create, inspect, claim, bind, and independently verify runs.
+					r.Post("/workflows", h.CreateWorkflowRun)
+					r.Get("/workflows/{runId}", h.GetWorkflowRun)
+					r.Post("/workflows/{runId}/claim", h.ClaimWorkflowNode)
+					r.Post("/workflows/{runId}/attempts/{attemptId}/bind-task", h.BindWorkflowTask)
+					r.Post("/workflows/{runId}/attempts/{attemptId}/verify", h.VerifyWorkflowAttempt)
 					r.Get("/members", h.ListMembersWithUser)
 					r.Post("/leave", h.LeaveWorkspace)
 					r.Get("/invitations", h.ListWorkspaceInvitations)

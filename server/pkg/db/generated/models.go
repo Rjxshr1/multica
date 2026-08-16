@@ -1443,6 +1443,162 @@ type WebhookDelivery struct {
 	DispatchAttempts       int32              `json:"dispatch_attempts"`
 }
 
+type WorkflowArtifact struct {
+	ID              pgtype.UUID        `json:"id"`
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	RunID           pgtype.UUID        `json:"run_id"`
+	NodeID          pgtype.UUID        `json:"node_id"`
+	AttemptID       pgtype.UUID        `json:"attempt_id"`
+	Kind            string             `json:"kind"`
+	Uri             string             `json:"uri"`
+	Digest          string             `json:"digest"`
+	Manifest        []byte             `json:"manifest"`
+	CreatedByTaskID pgtype.UUID        `json:"created_by_task_id"`
+	CreatedByType   string             `json:"created_by_type"`
+	CreatedByID     pgtype.UUID        `json:"created_by_id"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type WorkflowAttempt struct {
+	ID            pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	RunID         pgtype.UUID        `json:"run_id"`
+	NodeID        pgtype.UUID        `json:"node_id"`
+	AttemptNo     int32              `json:"attempt_no"`
+	FenceToken    int64              `json:"fence_token"`
+	TaskID        pgtype.UUID        `json:"task_id"`
+	ExecutorID    pgtype.UUID        `json:"executor_id"`
+	RuntimeID     pgtype.UUID        `json:"runtime_id"`
+	Status        string             `json:"status"`
+	ResultPayload []byte             `json:"result_payload"`
+	ResultDigest  pgtype.Text        `json:"result_digest"`
+	FailureCode   pgtype.Text        `json:"failure_code"`
+	FailureDetail pgtype.Text        `json:"failure_detail"`
+	DeadlineAt    pgtype.Timestamptz `json:"deadline_at"`
+	NextRetryAt   pgtype.Timestamptz `json:"next_retry_at"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	StartedAt     pgtype.Timestamptz `json:"started_at"`
+	CompletedAt   pgtype.Timestamptz `json:"completed_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
+type WorkflowEvent struct {
+	ID                pgtype.UUID        `json:"id"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	RunID             pgtype.UUID        `json:"run_id"`
+	Sequence          int64              `json:"sequence"`
+	AggregateType     string             `json:"aggregate_type"`
+	AggregateID       pgtype.UUID        `json:"aggregate_id"`
+	EventType         string             `json:"event_type"`
+	FromState         pgtype.Text        `json:"from_state"`
+	ToState           pgtype.Text        `json:"to_state"`
+	AggregateRevision int64              `json:"aggregate_revision"`
+	ActorType         string             `json:"actor_type"`
+	ActorID           pgtype.UUID        `json:"actor_id"`
+	AttemptID         pgtype.UUID        `json:"attempt_id"`
+	VerificationID    pgtype.UUID        `json:"verification_id"`
+	IdempotencyKey    pgtype.Text        `json:"idempotency_key"`
+	Payload           []byte             `json:"payload"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+type WorkflowNodeDependency struct {
+	ID                pgtype.UUID        `json:"id"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	RunID             pgtype.UUID        `json:"run_id"`
+	PredecessorNodeID pgtype.UUID        `json:"predecessor_node_id"`
+	SuccessorNodeID   pgtype.UUID        `json:"successor_node_id"`
+	Condition         string             `json:"condition"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+type WorkflowNodeExecution struct {
+	ID                 pgtype.UUID        `json:"id"`
+	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
+	RunID              pgtype.UUID        `json:"run_id"`
+	NodeKey            string             `json:"node_key"`
+	IssueID            pgtype.UUID        `json:"issue_id"`
+	NodeKind           string             `json:"node_kind"`
+	Status             string             `json:"status"`
+	Revision           int64              `json:"revision"`
+	FenceToken         int64              `json:"fence_token"`
+	ActiveAttemptID    pgtype.UUID        `json:"active_attempt_id"`
+	AttemptCount       int32              `json:"attempt_count"`
+	ExecutorSpec       []byte             `json:"executor_spec"`
+	RetryPolicy        []byte             `json:"retry_policy"`
+	VerificationPolicy []byte             `json:"verification_policy"`
+	InputSpec          []byte             `json:"input_spec"`
+	InputDigest        string             `json:"input_digest"`
+	ReadyAt            pgtype.Timestamptz `json:"ready_at"`
+	StartedAt          pgtype.Timestamptz `json:"started_at"`
+	CompletedAt        pgtype.Timestamptz `json:"completed_at"`
+	NextRetryAt        pgtype.Timestamptz `json:"next_retry_at"`
+	FailureCode        pgtype.Text        `json:"failure_code"`
+	FailureDetail      pgtype.Text        `json:"failure_detail"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+}
+
+type WorkflowOutbox struct {
+	ID             pgtype.UUID        `json:"id"`
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	RunID          pgtype.UUID        `json:"run_id"`
+	EventID        pgtype.UUID        `json:"event_id"`
+	Topic          string             `json:"topic"`
+	EventKey       string             `json:"event_key"`
+	Payload        []byte             `json:"payload"`
+	Status         string             `json:"status"`
+	AvailableAt    pgtype.Timestamptz `json:"available_at"`
+	LeaseToken     pgtype.UUID        `json:"lease_token"`
+	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
+	Attempts       int32              `json:"attempts"`
+	LastError      pgtype.Text        `json:"last_error"`
+	PublishedAt    pgtype.Timestamptz `json:"published_at"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+}
+
+type WorkflowRun struct {
+	ID                pgtype.UUID        `json:"id"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	RootIssueID       pgtype.UUID        `json:"root_issue_id"`
+	Status            string             `json:"status"`
+	Revision          int64              `json:"revision"`
+	DefinitionKey     string             `json:"definition_key"`
+	DefinitionVersion string             `json:"definition_version"`
+	DefinitionDigest  string             `json:"definition_digest"`
+	PlanSnapshot      []byte             `json:"plan_snapshot"`
+	PolicySnapshot    []byte             `json:"policy_snapshot"`
+	IdempotencyKey    pgtype.Text        `json:"idempotency_key"`
+	CreatedByType     string             `json:"created_by_type"`
+	CreatedByID       pgtype.UUID        `json:"created_by_id"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	StartedAt         pgtype.Timestamptz `json:"started_at"`
+	CompletedAt       pgtype.Timestamptz `json:"completed_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
+type WorkflowVerification struct {
+	ID                  pgtype.UUID        `json:"id"`
+	WorkspaceID         pgtype.UUID        `json:"workspace_id"`
+	RunID               pgtype.UUID        `json:"run_id"`
+	NodeID              pgtype.UUID        `json:"node_id"`
+	AttemptID           pgtype.UUID        `json:"attempt_id"`
+	VerificationNo      int32              `json:"verification_no"`
+	VerifierKind        string             `json:"verifier_kind"`
+	VerifierID          pgtype.UUID        `json:"verifier_id"`
+	VerificationTaskID  pgtype.UUID        `json:"verification_task_id"`
+	Status              string             `json:"status"`
+	InputArtifactDigest pgtype.Text        `json:"input_artifact_digest"`
+	Result              []byte             `json:"result"`
+	FailureCode         pgtype.Text        `json:"failure_code"`
+	IdempotencyKey      pgtype.Text        `json:"idempotency_key"`
+	StartedAt           pgtype.Timestamptz `json:"started_at"`
+	CompletedAt         pgtype.Timestamptz `json:"completed_at"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Workspace struct {
 	ID           pgtype.UUID        `json:"id"`
 	Name         string             `json:"name"`

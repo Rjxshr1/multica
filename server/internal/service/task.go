@@ -37,11 +37,14 @@ import (
 type TaskService struct {
 	Queries   *db.Queries
 	TxStarter TxStarter
-	Hub       *realtime.Hub
-	Bus       *events.Bus
-	Analytics analytics.Client
-	Metrics   *obsmetrics.BusinessMetrics
-	Wakeup    TaskWakeupNotifier
+	// WorkflowRuntime owns retry and verification for tasks bound to a
+	// workflow_attempt. Nil preserves all legacy task behavior.
+	WorkflowRuntime *WorkflowRuntimeService
+	Hub             *realtime.Hub
+	Bus             *events.Bus
+	Analytics       analytics.Client
+	Metrics         *obsmetrics.BusinessMetrics
+	Wakeup          TaskWakeupNotifier
 	// FeatureFlags is the server-side toggle router. Nil is valid and returns
 	// each call site's default.
 	FeatureFlags *featureflag.Service
@@ -3557,11 +3560,24 @@ func (s *TaskService) MarkTaskWaitingLocalDirectory(ctx context.Context, taskID 
 // causing the new task to resume against a stale (or NULL) session.
 func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, result []byte, sessionID, workDir, branchName string, sessionRolloutMissing bool, retiredSessionID string) (*db.AgentTaskQueue, error) {
 	var task db.AgentTaskQueue
+	var workflowAttempt db.WorkflowAttempt
+	workflowOwned := false
+	if s.WorkflowRuntime != nil {
+		if bound, err := s.Queries.GetWorkflowAttemptByTask(ctx, taskID); err == nil {
+			workflowAttempt = bound
+			workflowOwned = true
+		}
+	}
 	// chatAssistantMsg is the single assistant outcome row written for a chat
 	// task inside the completion transaction below. It is broadcast (chat:done)
 	// only after the transaction commits.
 	var chatAssistantMsg *db.ChatMessage
 	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		if workflowOwned {
+			if err := qtx.LockWorkflowRun(ctx, util.UUIDToString(workflowAttempt.RunID)); err != nil {
+				return err
+			}
+		}
 		if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
 			return err
 		}
@@ -3578,6 +3594,11 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 			return err
 		}
 		task = t
+		if s.WorkflowRuntime != nil {
+			if _, err := s.WorkflowRuntime.SettleTaskSuccessTx(ctx, qtx, taskID, result); err != nil {
+				return fmt.Errorf("settle workflow task completion: %w", err)
+			}
+		}
 
 		if t.ChatSessionID.Valid {
 			// Pin the chat_session's runtime_id alongside the session_id so the
@@ -3994,7 +4015,15 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 		retryFireAt      pgtype.Timestamptz
 		retryMaxAttempts pgtype.Int4
 	)
-	if retryableReasons[failureReason] {
+	var workflowAttempt db.WorkflowAttempt
+	workflowOwned := false
+	if s.WorkflowRuntime != nil {
+		if bound, err := s.Queries.GetWorkflowAttemptByTask(ctx, taskID); err == nil {
+			workflowAttempt = bound
+			workflowOwned = true
+		}
+	}
+	if !workflowOwned && retryableReasons[failureReason] {
 		if parent, perr := s.Queries.GetAgentTask(ctx, taskID); perr != nil {
 			slog.Warn("fail task auto-retry: load parent failed",
 				"task_id", util.UUIDToString(taskID), "error", perr)
@@ -4025,6 +4054,11 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 	var task db.AgentTaskQueue
 	var retried *db.AgentTaskQueue
 	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
+		if workflowOwned {
+			if err := qtx.LockWorkflowRun(ctx, util.UUIDToString(workflowAttempt.RunID)); err != nil {
+				return err
+			}
+		}
 		if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
 			return err
 		}
@@ -4046,6 +4080,18 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 			return err
 		}
 		task = t
+		if s.WorkflowRuntime != nil {
+			owned, err := s.WorkflowRuntime.SettleTaskFailureTx(ctx, qtx, taskID, failureReason, errMsg)
+			if err != nil {
+				return fmt.Errorf("settle workflow task failure: %w", err)
+			}
+			if owned {
+				// Binding may have committed after the preflight read. The
+				// transactional settlement result is authoritative: never create
+				// a legacy retry child for a Workflow-owned task.
+				wantRetry = false
+			}
+		}
 
 		// Keep resume-unsafe sessions on the task row for observability, but
 		// do not promote them to the chat-level resume pointer.
