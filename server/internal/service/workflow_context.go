@@ -22,6 +22,12 @@ var workflowContextKinds = map[string]bool{
 	"verification": true, "event": true, "artifact": true,
 }
 
+var workflowContextLikeEscaper = strings.NewReplacer(
+	`\`, `\\`,
+	`%`, `\%`,
+	`_`, `\_`,
+)
+
 type WorkflowContextCatalog struct {
 	SnapshotID      string                       `json:"snapshot_id"`
 	RunID           string                       `json:"run_id"`
@@ -276,6 +282,7 @@ func (s *WorkflowRuntimeService) ContextBootstrap(ctx context.Context, workspace
 }
 
 func (s *WorkflowRuntimeService) SearchContext(ctx context.Context, workspaceID, taskID pgtype.UUID, input WorkflowContextSearchInput) ([]WorkflowContextItemView, error) {
+	query := strings.TrimSpace(input.Query)
 	snapshot, err := s.Queries.GetWorkflowContextSnapshotByTask(ctx, db.GetWorkflowContextSnapshotByTaskParams{TaskID: taskID, WorkspaceID: workspaceID})
 	if err != nil {
 		return nil, err
@@ -295,13 +302,25 @@ func (s *WorkflowRuntimeService) SearchContext(ctx context.Context, workspaceID,
 		}
 		kinds = append(kinds, kind)
 	}
-	items, err := s.Queries.SearchWorkflowContextItems(ctx, db.SearchWorkflowContextItemsParams{
-		SnapshotID: snapshot.ID, WorkspaceID: workspaceID, Query: strings.TrimSpace(input.Query), Kinds: kinds, ResultLimit: limit,
-	})
+	var items []db.WorkflowContextItem
+	if query == "" {
+		items, err = s.Queries.ListWorkflowContextItemsForEmptySearch(ctx, db.ListWorkflowContextItemsForEmptySearchParams{
+			SnapshotID: snapshot.ID, WorkspaceID: workspaceID, Kinds: kinds, ResultLimit: limit,
+		})
+	} else {
+		items, err = s.Queries.SearchWorkflowContextItems(ctx, db.SearchWorkflowContextItemsParams{
+			SnapshotID: snapshot.ID, WorkspaceID: workspaceID, Query: query,
+			QueryPattern: workflowContextLikePattern(query), Kinds: kinds, ResultLimit: limit,
+		})
+	}
 	if err != nil {
 		return nil, err
 	}
 	return contextItemViews(items), nil
+}
+
+func workflowContextLikePattern(query string) string {
+	return "%" + workflowContextLikeEscaper.Replace(query) + "%"
 }
 
 func (s *WorkflowRuntimeService) GetContextItem(ctx context.Context, workspaceID, taskID pgtype.UUID, referenceKey string) (*WorkflowContextItemView, error) {

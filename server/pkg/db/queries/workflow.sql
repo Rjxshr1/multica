@@ -180,14 +180,24 @@ ORDER BY ordinal;
 -- name: SearchWorkflowContextItems :many
 SELECT * FROM workflow_context_item
 WHERE snapshot_id = @snapshot_id AND workspace_id = @workspace_id
-  AND (sqlc.arg('query')::text = '' OR search_text ILIKE '%' || sqlc.arg('query')::text || '%')
+  AND search_text ILIKE sqlc.arg('query_pattern')::text ESCAPE E'\\'
   AND (cardinality(sqlc.arg('kinds')::text[]) = 0 OR kind = ANY(sqlc.arg('kinds')::text[]))
 ORDER BY
   CASE WHEN lower(title) = lower(sqlc.arg('query')::text) THEN 0
        WHEN lower(reference_key) = lower(sqlc.arg('query')::text) THEN 1
-       WHEN lower(title) LIKE '%' || lower(sqlc.arg('query')::text) || '%' THEN 2
+       WHEN lower(title) LIKE lower(sqlc.arg('query_pattern')::text) ESCAPE E'\\' THEN 2
        ELSE 3 END,
   ordinal
+LIMIT @result_limit;
+
+-- name: ListWorkflowContextItemsForEmptySearch :many
+-- Preserve the direct HTTP API's historical empty-query behavior without
+-- mixing list semantics into the prepared non-empty search statement. The
+-- Context MCP itself rejects empty queries.
+SELECT * FROM workflow_context_item
+WHERE snapshot_id = @snapshot_id AND workspace_id = @workspace_id
+  AND (cardinality(sqlc.arg('kinds')::text[]) = 0 OR kind = ANY(sqlc.arg('kinds')::text[]))
+ORDER BY ordinal
 LIMIT @result_limit;
 
 -- name: GetWorkflowContextItemByReference :one

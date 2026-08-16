@@ -125,7 +125,7 @@ func contextMCPTools() []map[string]any {
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false},
 		},
 		{
-			"name": "context_search", "description": "Search this Attempt's immutable context snapshot. Use kinds to narrow to dependency, attempt, verification, event, artifact, task, or workflow.",
+			"name": "context_search", "description": "Search for literal text in this Attempt's immutable context snapshot. Use kinds to narrow to dependency, attempt, verification, event, artifact, task, or workflow.",
 			"inputSchema": map[string]any{
 				"type": "object", "properties": map[string]any{
 					"query": map[string]any{"type": "string"},

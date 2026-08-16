@@ -291,6 +291,28 @@ func TestWorkflowTaskServiceCompletionEntersVerification(t *testing.T) {
 	if len(results) != 1 || results[0].ReferenceKey != "task/current" {
 		t.Fatalf("task context search = %+v, want task/current", results)
 	}
+	emptyResults, err := workflow.SearchContext(ctx, workspaceID, util.MustParseUUID(taskIDText), WorkflowContextSearchInput{Query: "  ", Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(emptyResults) != 1 || emptyResults[0].ReferenceKey != "task/current" {
+		t.Fatalf("empty context search = %+v, want first frozen item", emptyResults)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE workflow_context_item
+		SET search_text = CASE reference_key
+			WHEN 'task/current' THEN 'marker_node_1'
+			WHEN 'workflow/overview' THEN 'marker_nodeX1'
+			ELSE search_text END
+		WHERE snapshot_id = $1`, catalogBefore.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	literalResults, err := workflow.SearchContext(ctx, workspaceID, util.MustParseUUID(taskIDText), WorkflowContextSearchInput{Query: "marker_node_1", Limit: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(literalResults) != 1 || literalResults[0].ReferenceKey != "task/current" {
+		t.Fatalf("literal context search = %+v, want only task/current", literalResults)
+	}
 	frozenTask, err := workflow.GetContextItem(ctx, workspaceID, util.MustParseUUID(taskIDText), "task/current")
 	if err != nil {
 		t.Fatal(err)

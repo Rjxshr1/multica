@@ -1499,6 +1499,63 @@ func (q *Queries) ListWorkflowContextItems(ctx context.Context, arg ListWorkflow
 	return items, nil
 }
 
+const listWorkflowContextItemsForEmptySearch = `-- name: ListWorkflowContextItemsForEmptySearch :many
+SELECT id, workspace_id, snapshot_id, ordinal, reference_key, kind, title, content, search_text, source_type, source_id, source_digest, created_at FROM workflow_context_item
+WHERE snapshot_id = $1 AND workspace_id = $2
+  AND (cardinality($3::text[]) = 0 OR kind = ANY($3::text[]))
+ORDER BY ordinal
+LIMIT $4
+`
+
+type ListWorkflowContextItemsForEmptySearchParams struct {
+	SnapshotID  pgtype.UUID `json:"snapshot_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	Kinds       []string    `json:"kinds"`
+	ResultLimit int32       `json:"result_limit"`
+}
+
+// Preserve the direct HTTP API's historical empty-query behavior without
+// mixing list semantics into the prepared non-empty search statement. The
+// Context MCP itself rejects empty queries.
+func (q *Queries) ListWorkflowContextItemsForEmptySearch(ctx context.Context, arg ListWorkflowContextItemsForEmptySearchParams) ([]WorkflowContextItem, error) {
+	rows, err := q.db.Query(ctx, listWorkflowContextItemsForEmptySearch,
+		arg.SnapshotID,
+		arg.WorkspaceID,
+		arg.Kinds,
+		arg.ResultLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WorkflowContextItem{}
+	for rows.Next() {
+		var i WorkflowContextItem
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.SnapshotID,
+			&i.Ordinal,
+			&i.ReferenceKey,
+			&i.Kind,
+			&i.Title,
+			&i.Content,
+			&i.SearchText,
+			&i.SourceType,
+			&i.SourceID,
+			&i.SourceDigest,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWorkflowDependencies = `-- name: ListWorkflowDependencies :many
 SELECT id, workspace_id, run_id, predecessor_node_id, successor_node_id, condition, created_at FROM workflow_node_dependency
 WHERE run_id = $1 AND workspace_id = $2
@@ -1870,31 +1927,33 @@ func (q *Queries) RetryWorkflowOutbox(ctx context.Context, arg RetryWorkflowOutb
 const searchWorkflowContextItems = `-- name: SearchWorkflowContextItems :many
 SELECT id, workspace_id, snapshot_id, ordinal, reference_key, kind, title, content, search_text, source_type, source_id, source_digest, created_at FROM workflow_context_item
 WHERE snapshot_id = $1 AND workspace_id = $2
-  AND ($3::text = '' OR search_text ILIKE '%' || $3::text || '%')
+  AND search_text ILIKE $3::text ESCAPE E'\\'
   AND (cardinality($4::text[]) = 0 OR kind = ANY($4::text[]))
 ORDER BY
-  CASE WHEN lower(title) = lower($3::text) THEN 0
-       WHEN lower(reference_key) = lower($3::text) THEN 1
-       WHEN lower(title) LIKE '%' || lower($3::text) || '%' THEN 2
+  CASE WHEN lower(title) = lower($5::text) THEN 0
+       WHEN lower(reference_key) = lower($5::text) THEN 1
+       WHEN lower(title) LIKE lower($3::text) ESCAPE E'\\' THEN 2
        ELSE 3 END,
   ordinal
-LIMIT $5
+LIMIT $6
 `
 
 type SearchWorkflowContextItemsParams struct {
-	SnapshotID  pgtype.UUID `json:"snapshot_id"`
-	WorkspaceID pgtype.UUID `json:"workspace_id"`
-	Query       string      `json:"query"`
-	Kinds       []string    `json:"kinds"`
-	ResultLimit int32       `json:"result_limit"`
+	SnapshotID   pgtype.UUID `json:"snapshot_id"`
+	WorkspaceID  pgtype.UUID `json:"workspace_id"`
+	QueryPattern string      `json:"query_pattern"`
+	Kinds        []string    `json:"kinds"`
+	Query        string      `json:"query"`
+	ResultLimit  int32       `json:"result_limit"`
 }
 
 func (q *Queries) SearchWorkflowContextItems(ctx context.Context, arg SearchWorkflowContextItemsParams) ([]WorkflowContextItem, error) {
 	rows, err := q.db.Query(ctx, searchWorkflowContextItems,
 		arg.SnapshotID,
 		arg.WorkspaceID,
-		arg.Query,
+		arg.QueryPattern,
 		arg.Kinds,
+		arg.Query,
 		arg.ResultLimit,
 	)
 	if err != nil {
