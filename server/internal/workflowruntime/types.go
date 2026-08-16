@@ -52,13 +52,24 @@ const (
 	FailureDependencyGap     FailureClass = "dependency_gap"
 	FailureContractAmbiguity FailureClass = "contract_ambiguity"
 	FailureSecurityRisk      FailureClass = "security_risk"
+	FailureNoProgress        FailureClass = "no_progress"
+	FailureDeadlineExceeded  FailureClass = "deadline_exceeded"
 	FailureUnclassified      FailureClass = "unclassified"
 )
 
 type NodeSpec struct {
-	ID          string   `json:"id"`
-	DependsOn   []string `json:"depends_on,omitempty"`
-	MaxAttempts int      `json:"max_attempts"`
+	ID              string               `json:"id"`
+	DependsOn       []string             `json:"depends_on,omitempty"`
+	MaxAttempts     int                  `json:"max_attempts"`
+	ExecutionBudget *ExecutionBudgetSpec `json:"execution_budget,omitempty"`
+}
+
+// ExecutionBudgetSpec is a node-level policy. Zero values mean "use the
+// executor default" so old workflow definitions remain compatible.
+type ExecutionBudgetSpec struct {
+	FirstProgressTimeoutSeconds int `json:"first_progress_timeout_seconds,omitempty"`
+	IdleTimeoutSeconds          int `json:"idle_timeout_seconds,omitempty"`
+	HardTimeoutSeconds          int `json:"hard_timeout_seconds,omitempty"`
 }
 
 type WorkflowSpec struct {
@@ -67,13 +78,15 @@ type WorkflowSpec struct {
 }
 
 type Attempt struct {
-	ID           string       `json:"id"`
-	Number       int          `json:"number"`
-	Fence        uint64       `json:"fence"`
-	State        AttemptState `json:"state"`
-	FailureClass FailureClass `json:"failure_class,omitempty"`
-	StartedAt    time.Time    `json:"started_at"`
-	FinishedAt   *time.Time   `json:"finished_at,omitempty"`
+	ID             string       `json:"id"`
+	Number         int          `json:"number"`
+	Fence          uint64       `json:"fence"`
+	State          AttemptState `json:"state"`
+	FailureClass   FailureClass `json:"failure_class,omitempty"`
+	StartedAt      time.Time    `json:"started_at"`
+	LastProgressAt *time.Time   `json:"last_progress_at,omitempty"`
+	ProgressCount  int          `json:"progress_count,omitempty"`
+	FinishedAt     *time.Time   `json:"finished_at,omitempty"`
 }
 
 type NodeExecution struct {
@@ -104,6 +117,8 @@ type EventType string
 const (
 	EventWorkflowCreated      EventType = "workflow.created"
 	EventNodeClaimed          EventType = "node.claimed"
+	EventAttemptProgressed    EventType = "attempt.progressed"
+	EventAttemptFailed        EventType = "attempt.failed"
 	EventTaskResultAccepted   EventType = "task.result_accepted"
 	EventVerificationPassed   EventType = "verification.passed"
 	EventVerificationRejected EventType = "verification.rejected"

@@ -118,6 +118,60 @@ func (e *Engine) ReportTaskSucceeded(lease Lease, commandID string) error {
 	return err
 }
 
+// ReportProgress records durable, fenced evidence that the active attempt made
+// forward progress. The event is idempotent by commandID and never changes the
+// node's execution state.
+func (e *Engine) ReportProgress(lease Lease, commandID string) error {
+	if e.store.CommandApplied(lease.RunID, commandID) {
+		return nil
+	}
+	run, node, err := e.nodeForLease(lease)
+	if err != nil {
+		return err
+	}
+	if node.State != NodeRunning {
+		return fmt.Errorf("%w: node %s is %s, want running", ErrInvalidState, lease.NodeID, node.State)
+	}
+	_, err = e.store.Append(lease.RunID, run.Version, commandID, Event{
+		Type:       EventAttemptProgressed,
+		OccurredAt: e.now(),
+		NodeID:     lease.NodeID,
+		AttemptID:  lease.AttemptID,
+		Attempt:    lease.Attempt,
+		Fence:      lease.Fence,
+	})
+	return err
+}
+
+// FailAttempt settles an active attempt that could not produce a task result,
+// such as a no-progress or hard-deadline timeout. It is valid from running or
+// verifying and routes through the node's bounded retry policy.
+func (e *Engine) FailAttempt(lease Lease, failure FailureClass, commandID string) error {
+	if e.store.CommandApplied(lease.RunID, commandID) {
+		return nil
+	}
+	if failure == "" {
+		failure = FailureUnclassified
+	}
+	run, node, err := e.nodeForLease(lease)
+	if err != nil {
+		return err
+	}
+	if node.State != NodeRunning && node.State != NodeVerifying {
+		return fmt.Errorf("%w: node %s is %s, want running or verifying", ErrInvalidState, lease.NodeID, node.State)
+	}
+	_, err = e.store.Append(lease.RunID, run.Version, commandID, Event{
+		Type:         EventAttemptFailed,
+		OccurredAt:   e.now(),
+		NodeID:       lease.NodeID,
+		AttemptID:    lease.AttemptID,
+		Attempt:      lease.Attempt,
+		Fence:        lease.Fence,
+		FailureClass: failure,
+	})
+	return err
+}
+
 func (e *Engine) Verify(lease Lease, passed bool, failure FailureClass, commandID string) error {
 	if e.store.CommandApplied(lease.RunID, commandID) {
 		return nil
@@ -263,6 +317,25 @@ func applyEvent(run *WorkflowRun, event Event) error {
 			State:     AttemptRunning,
 			StartedAt: event.OccurredAt,
 		})
+	case EventAttemptProgressed:
+		_, attempt, err := activeAttempt(run, event)
+		if err != nil {
+			return err
+		}
+		progressedAt := event.OccurredAt
+		attempt.LastProgressAt = &progressedAt
+		attempt.ProgressCount++
+	case EventAttemptFailed:
+		node, attempt, err := activeAttempt(run, event)
+		if err != nil {
+			return err
+		}
+		finishedAt := event.OccurredAt
+		attempt.State = AttemptRejected
+		attempt.FailureClass = event.FailureClass
+		attempt.FinishedAt = &finishedAt
+		node.ActiveAttemptID = ""
+		routeFailure(run, node, event.FailureClass)
 	case EventTaskResultAccepted:
 		node, attempt, err := activeAttempt(run, event)
 		if err != nil {
@@ -390,6 +463,11 @@ func validateSpec(spec WorkflowSpec) error {
 		}
 		if node.MaxAttempts < 0 {
 			return fmt.Errorf("node %q max_attempts cannot be negative", node.ID)
+		}
+		if budget := node.ExecutionBudget; budget != nil {
+			if budget.FirstProgressTimeoutSeconds < 0 || budget.IdleTimeoutSeconds < 0 || budget.HardTimeoutSeconds < 0 {
+				return fmt.Errorf("node %q execution budget cannot be negative", node.ID)
+			}
 		}
 		nodes[node.ID] = node
 	}

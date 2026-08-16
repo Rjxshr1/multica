@@ -39,6 +39,8 @@ cp "$project_root/scripts/workflow-real-ab/models.json" "$pi_config/models.json"
 cd "$project_root/server"
 go run ./cmd/workflow_real_ab \
   --arm "${MULTICA_REAL_AB_ARM:-all}" \
+  --scenarios "${MULTICA_REAL_AB_SCENARIOS:-all}" \
+  --repetitions "${MULTICA_REAL_AB_REPETITIONS:-1}" \
   --output "$eval_root/runs" \
   --pi "$pi_path" \
   --pi-config "$pi_config"

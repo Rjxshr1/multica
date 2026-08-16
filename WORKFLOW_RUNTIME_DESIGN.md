@@ -1,6 +1,6 @@
 # Multica Workflow Runtime 架构设计
 
-> 状态：设计评审稿，不包含实现
+> 状态：底层 Runtime、数据库集成与真实 A/B 已实现并完成首轮验收
 >
 > 日期：2026-08-16
 >
@@ -54,7 +54,7 @@ Agent 从“状态写者”降为“结果与证据提交者”，Issue 从 Work
 
 ## 范围
 
-本设计覆盖：
+当前实现与设计覆盖：
 
 - WorkflowRun、NodeExecution、ExecutionAttempt；
 - ArtifactManifest、VerificationResult；

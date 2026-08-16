@@ -18,10 +18,40 @@ import (
 )
 
 const model = "deepseek-v4-pro[1m]"
+const maxCapturedModelOutput = 1024 * 1024
+
+type tailBuffer struct {
+	data  []byte
+	max   int
+	total int64
+}
+
+func (b *tailBuffer) Write(payload []byte) (int, error) {
+	written := len(payload)
+	b.total += int64(written)
+	if b.max <= 0 {
+		return written, nil
+	}
+	if len(payload) >= b.max {
+		b.data = append(b.data[:0], payload[len(payload)-b.max:]...)
+		return written, nil
+	}
+	overflow := len(b.data) + len(payload) - b.max
+	if overflow > 0 {
+		copy(b.data, b.data[overflow:])
+		b.data = b.data[:len(b.data)-overflow]
+	}
+	b.data = append(b.data, payload...)
+	return written, nil
+}
+
+func (b *tailBuffer) String() string  { return string(b.data) }
+func (b *tailBuffer) Truncated() bool { return b.total > int64(len(b.data)) }
 
 type result struct {
 	Arm        string   `json:"arm"`
 	Scenario   string   `json:"scenario"`
+	Repetition int      `json:"repetition"`
 	Passed     bool     `json:"passed"`
 	Reason     string   `json:"reason,omitempty"`
 	DurationMS int64    `json:"duration_ms"`
@@ -30,12 +60,19 @@ type result struct {
 }
 
 type evaluator struct {
-	root      string
-	piPath    string
-	piConfig  string
-	arm       string
-	results   []result
-	callCount int
+	root        string
+	piPath      string
+	piConfig    string
+	arm         string
+	results     []result
+	callCount   int
+	repetition  int
+	repeatCount int
+}
+
+type readOnlyMount struct {
+	Host  string
+	Guest string
 }
 
 func main() {
@@ -43,10 +80,15 @@ func main() {
 	root := flag.String("output", "/home/ai/codex-work/multica-workflow-eval/runs", "evaluation output directory")
 	piPath := flag.String("pi", "/home/ai/codex-work/multica-workflow-eval/tooling/node_modules/.bin/pi", "Pi executable")
 	piConfig := flag.String("pi-config", "/home/ai/codex-work/multica-workflow-eval/pi-config", "Pi config directory")
+	selectedScenarios := flag.String("scenarios", "all", "comma-separated scenario names, or all")
+	repetitions := flag.Int("repetitions", 1, "paired repetitions per arm")
 	flag.Parse()
 
 	if *arm != "all" && *arm != "original" && *arm != "new" {
 		fatalf("invalid arm %q", *arm)
+	}
+	if *repetitions < 1 {
+		fatalf("repetitions must be at least 1")
 	}
 	stamp := time.Now().UTC().Format("20060102T150405Z")
 	runRoot := filepath.Join(*root, stamp)
@@ -59,10 +101,16 @@ func main() {
 		arms = []string{"original", "new"}
 	}
 	var all []result
-	for _, name := range arms {
-		e := &evaluator{root: runRoot, piPath: *piPath, piConfig: *piConfig, arm: name}
-		e.runAll()
-		all = append(all, e.results...)
+	for repetition := 1; repetition <= *repetitions; repetition++ {
+		orderedArms := append([]string(nil), arms...)
+		if repetition%2 == 0 && len(orderedArms) == 2 {
+			orderedArms[0], orderedArms[1] = orderedArms[1], orderedArms[0]
+		}
+		for _, name := range orderedArms {
+			e := &evaluator{root: runRoot, piPath: *piPath, piConfig: *piConfig, arm: name, repetition: repetition, repeatCount: *repetitions}
+			e.runAll(*selectedScenarios)
+			all = append(all, e.results...)
+		}
 	}
 	if err := writeJSON(filepath.Join(runRoot, "summary.json"), all); err != nil {
 		fatalf("write summary: %v", err)
@@ -70,19 +118,44 @@ func main() {
 	printSummary(runRoot, all)
 }
 
-func (e *evaluator) runAll() {
-	e.run("read_code_review", e.readCodeReview)
-	e.run("simple_fix", e.simpleFix)
-	e.run("behavior_preserving_refactor", e.behaviorPreservingRefactor)
-	e.run("technical_design", e.technicalDesign)
-	e.run("verification_retry", e.verificationRetry)
-	e.run("cross_workflow_review_insertion", e.crossWorkflow)
+func (e *evaluator) runAll(selected string) {
+	cases := []struct {
+		name string
+		run  func(string) (bool, string, []string)
+	}{
+		{"read_code_review", e.readCodeReview},
+		{"simple_fix", e.simpleFix},
+		{"behavior_preserving_refactor", e.behaviorPreservingRefactor},
+		{"technical_design", e.technicalDesign},
+		{"chained_integration", e.chainedIntegration},
+		{"verification_retry", e.verificationRetry},
+		{"cross_workflow_review_insertion", e.crossWorkflow},
+	}
+	wanted := make(map[string]bool)
+	if selected != "all" {
+		for _, name := range strings.Split(selected, ",") {
+			wanted[strings.TrimSpace(name)] = true
+		}
+	}
+	matched := 0
+	for _, item := range cases {
+		if selected == "all" || wanted[item.name] {
+			e.run(item.name, item.run)
+			matched++
+		}
+	}
+	if matched == 0 {
+		fatalf("no scenarios matched %q", selected)
+	}
 }
 
 func (e *evaluator) run(name string, fn func(string) (bool, string, []string)) {
 	started := time.Now()
 	before := e.callCount
 	dir := filepath.Join(e.root, e.arm, name)
+	if e.repeatCount > 1 {
+		dir = filepath.Join(e.root, fmt.Sprintf("repeat-%02d", e.repetition), e.arm, name)
+	}
 	if err := os.RemoveAll(dir); err != nil {
 		fatalf("reset fixture: %v", err)
 	}
@@ -90,7 +163,7 @@ func (e *evaluator) run(name string, fn func(string) (bool, string, []string)) {
 		fatalf("create fixture: %v", err)
 	}
 	passed, reason, events := fn(dir)
-	r := result{Arm: e.arm, Scenario: name, Passed: passed, Reason: reason, DurationMS: time.Since(started).Milliseconds(), ModelCalls: e.callCount - before, Events: events}
+	r := result{Arm: e.arm, Scenario: name, Repetition: e.repetition, Passed: passed, Reason: reason, DurationMS: time.Since(started).Milliseconds(), ModelCalls: e.callCount - before, Events: events}
 	e.results = append(e.results, r)
 	_ = writeJSON(filepath.Join(dir, "result.json"), r)
 }
@@ -332,9 +405,24 @@ func (e *evaluator) execute(engine *workflowruntime.Engine, runID, nodeID, dir, 
 	if err != nil {
 		return false, err.Error()
 	}
-	if err := e.pi(dir, fmt.Sprintf("%s-a%d", nodeID, lease.Attempt), prompt); err != nil {
-		_ = engine.ReportTaskSucceeded(lease, fmt.Sprintf("report-%s", lease.AttemptID))
-		_ = engine.Verify(lease, false, workflowruntime.FailureEnvironmentGap, fmt.Sprintf("verify-%s", lease.AttemptID))
+	progressSequence := 0
+	budget := defaultEvaluationBudget()
+	if run, snapshotErr := engine.Snapshot(runID); snapshotErr == nil {
+		if node, ok := run.Nodes[nodeID]; ok {
+			budget = progressBudgetForNode(node.Spec)
+		}
+	}
+	if err := e.piWithProgress(dir, fmt.Sprintf("%s-a%d", nodeID, lease.Attempt), prompt, func() {
+		progressSequence++
+		_ = engine.ReportProgress(lease, fmt.Sprintf("progress-%s-%d", lease.AttemptID, progressSequence))
+	}, budget); err != nil {
+		failure := workflowruntime.FailureEnvironmentGap
+		if errors.Is(err, errNoProgress) {
+			failure = workflowruntime.FailureNoProgress
+		} else if errors.Is(err, errHardDeadline) {
+			failure = workflowruntime.FailureDeadlineExceeded
+		}
+		_ = engine.FailAttempt(lease, failure, fmt.Sprintf("fail-%s", lease.AttemptID))
 		return false, err.Error()
 	}
 	if err := engine.ReportTaskSucceeded(lease, fmt.Sprintf("report-%s", lease.AttemptID)); err != nil {
@@ -348,34 +436,117 @@ func (e *evaluator) execute(engine *workflowruntime.Engine, runID, nodeID, dir, 
 	return passed, why
 }
 
+func defaultEvaluationBudget() progressBudget {
+	// Conservative evaluation guardrails, not a production-wide definition of
+	// task failure. Nodes can override each dimension based on task complexity.
+	return progressBudget{
+		HardTimeout:          30 * time.Minute,
+		FirstProgressTimeout: 8 * time.Minute,
+		IdleTimeout:          5 * time.Minute,
+	}
+}
+
+func progressBudgetForNode(spec workflowruntime.NodeSpec) progressBudget {
+	budget := defaultEvaluationBudget()
+	if spec.ExecutionBudget == nil {
+		return budget
+	}
+	configured := spec.ExecutionBudget
+	if configured.FirstProgressTimeoutSeconds > 0 {
+		budget.FirstProgressTimeout = time.Duration(configured.FirstProgressTimeoutSeconds) * time.Second
+	}
+	if configured.IdleTimeoutSeconds > 0 {
+		budget.IdleTimeout = time.Duration(configured.IdleTimeoutSeconds) * time.Second
+	}
+	if configured.HardTimeoutSeconds > 0 {
+		budget.HardTimeout = time.Duration(configured.HardTimeoutSeconds) * time.Second
+	}
+	return budget
+}
+
 func (e *evaluator) pi(dir, label, prompt string) error {
+	return e.piWithProgress(dir, label, prompt, nil, defaultEvaluationBudget())
+}
+
+func (e *evaluator) piWithProgress(dir, label, prompt string, onProgress func(), budget progressBudget) error {
 	e.callCount++
 	logDir := filepath.Join(dir, "model-logs")
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return err
 	}
 	session := filepath.Join(logDir, label+".session.jsonl")
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, e.piPath, "-p", "--mode", "json", "--session", session, "--provider", "deepseek-anthropic", "--model", model)
+	toolRoot := filepath.Clean(filepath.Join(filepath.Dir(e.piPath), "..", ".."))
+	guestPiPath := filepath.Join("/tooling", "node_modules", ".bin", filepath.Base(e.piPath))
+	guestSession := filepath.Join("/workspace", "model-logs", label+".session.jsonl")
+	cmd := sandboxedCommand(dir, []readOnlyMount{
+		{Host: toolRoot, Guest: "/tooling"},
+		{Host: e.piConfig, Guest: "/pi-config"},
+	}, guestPiPath, "-p", "--mode", "json", "--session", guestSession, "--provider", "deepseek-anthropic", "--model", model)
 	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Env = cleanProxyEnv(os.Environ())
-	cmd.Env = append(cmd.Env, "PI_CODING_AGENT_DIR="+e.piConfig, "PI_TELEMETRY=0")
-	var output bytes.Buffer
+	cmd.Env = append(cmd.Env, "PI_CODING_AGENT_DIR=/pi-config", "PI_TELEMETRY=0", "HOME=/home/agent")
+	output := tailBuffer{max: maxCapturedModelOutput}
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 	started := time.Now()
-	err := cmd.Run()
-	log := map[string]any{"label": label, "prompt": prompt, "duration_ms": time.Since(started).Milliseconds(), "exit_error": errorString(err), "output": output.String()}
+	// Only semantic session events (tool/query/result) or durable repository
+	// artifacts renew the lease. Plain thinking/session growth is not progress.
+	probe := newCompositeProgressProbe(
+		newFilesystemProgressProbe(dir, filepath.Join(dir, ".git"), logDir),
+		newSessionSemanticProgressProbe(session),
+	)
+	budget.PollInterval = time.Second
+	budget.OnProgress = onProgress
+	err := runWithProgressBudget(context.Background(), cmd, budget, probe)
+	log := map[string]any{
+		"label": label, "prompt": prompt, "duration_ms": time.Since(started).Milliseconds(),
+		"exit_error": errorString(err), "output": output.String(),
+		"output_bytes": output.total, "output_truncated": output.Truncated(),
+	}
 	_ = writeJSON(filepath.Join(logDir, label+".json"), log)
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("Pi/DeepSeek %s exceeded 180s node timeout", label)
+	if errors.Is(err, errNoProgress) {
+		return fmt.Errorf("Pi/DeepSeek %s: %w", label, err)
+	}
+	if errors.Is(err, errHardDeadline) {
+		return fmt.Errorf("Pi/DeepSeek %s: %w", label, err)
 	}
 	if err != nil {
 		return fmt.Errorf("Pi/DeepSeek %s failed: %w", label, err)
 	}
 	return nil
+}
+
+// sandboxedCommand gives the model tools a deliberately narrow filesystem:
+// the current fixture is writable at /workspace, runtime/config mounts are
+// read-only, and previous runs plus verifier source are absent. Network stays
+// available for the model provider.
+func sandboxedCommand(workspace string, mounts []readOnlyMount, command string, args ...string) *exec.Cmd {
+	bwrapArgs := []string{
+		"--die-with-parent", "--new-session", "--unshare-all", "--share-net",
+		"--ro-bind", "/usr", "/usr",
+		"--ro-bind", "/bin", "/bin",
+		"--ro-bind", "/lib", "/lib",
+		"--ro-bind", "/lib64", "/lib64",
+		"--ro-bind", "/etc", "/etc",
+		"--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+		"--dir", "/home", "--dir", "/home/agent",
+		"--bind", workspace, "/workspace",
+	}
+	// WSL's /etc/resolv.conf points outside /etc, so expose only that
+	// generated resolver file instead of the rest of /mnt.
+	if _, err := os.Stat("/mnt/wsl/resolv.conf"); err == nil {
+		bwrapArgs = append(bwrapArgs,
+			"--dir", "/mnt", "--dir", "/mnt/wsl",
+			"--ro-bind", "/mnt/wsl/resolv.conf", "/mnt/wsl/resolv.conf",
+		)
+	}
+	for _, mount := range mounts {
+		bwrapArgs = append(bwrapArgs, "--ro-bind", mount.Host, mount.Guest)
+	}
+	bwrapArgs = append(bwrapArgs, "--chdir", "/workspace", command)
+	bwrapArgs = append(bwrapArgs, args...)
+	return exec.Command("bwrap", bwrapArgs...)
 }
 
 func cleanProxyEnv(env []string) []string {

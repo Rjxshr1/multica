@@ -219,6 +219,88 @@ func TestStaleFenceCannotOverwriteNewAttempt(t *testing.T) {
 	}
 }
 
+func TestNoProgressTimeoutRetriesWithNewFence(t *testing.T) {
+	store := NewMemoryEventStore()
+	engine := NewEngine(store)
+	if err := engine.Create(singleNodeSpec("run-timeout", 2), "create"); err != nil {
+		t.Fatal(err)
+	}
+	first := mustClaim(t, engine, "run-timeout", "work", "claim-1")
+	if err := engine.FailAttempt(first, FailureNoProgress, "timeout-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	run, err := engine.Snapshot("run-timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := run.Nodes["work"].State; got != NodeReady {
+		t.Fatalf("node state = %s, want ready for bounded retry", got)
+	}
+	if got := run.Nodes["work"].Attempts[0].FailureClass; got != FailureNoProgress {
+		t.Fatalf("failure class = %s, want %s", got, FailureNoProgress)
+	}
+
+	second := mustClaim(t, engine, "run-timeout", "work", "claim-2")
+	if second.Fence <= first.Fence {
+		t.Fatalf("second fence = %d, want greater than %d", second.Fence, first.Fence)
+	}
+	if err := engine.ReportProgress(first, "late-progress"); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("late progress error = %v, want ErrStaleFence", err)
+	}
+}
+
+func TestProgressIsDurableAndIdempotent(t *testing.T) {
+	store := NewMemoryEventStore()
+	engine := NewEngine(store)
+	if err := engine.Create(singleNodeSpec("run-progress", 1), "create"); err != nil {
+		t.Fatal(err)
+	}
+	lease := mustClaim(t, engine, "run-progress", "work", "claim")
+	if err := engine.ReportProgress(lease, "progress-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.ReportProgress(lease, "progress-1"); err != nil {
+		t.Fatalf("idempotent progress: %v", err)
+	}
+
+	run, err := engine.Snapshot("run-progress")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := run.Nodes["work"].Attempts[0]
+	if attempt.ProgressCount != 1 || attempt.LastProgressAt == nil {
+		t.Fatalf("progress = count %d at %v, want one durable progress event", attempt.ProgressCount, attempt.LastProgressAt)
+	}
+}
+
+func TestExecutionBudgetIsDurableAndValidated(t *testing.T) {
+	store := NewMemoryEventStore()
+	engine := NewEngine(store)
+	spec := singleNodeSpec("run-budget", 1)
+	spec.Nodes[0].ExecutionBudget = &ExecutionBudgetSpec{
+		FirstProgressTimeoutSeconds: 600,
+		IdleTimeoutSeconds:          300,
+		HardTimeoutSeconds:          3600,
+	}
+	if err := engine.Create(spec, "create-budget"); err != nil {
+		t.Fatal(err)
+	}
+	run, err := engine.Snapshot("run-budget")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := run.Nodes["work"].Spec.ExecutionBudget.HardTimeoutSeconds; got != 3600 {
+		t.Fatalf("hard timeout = %d, want 3600", got)
+	}
+
+	invalid := singleNodeSpec("run-invalid-budget", 1)
+	invalid.Nodes[0].ExecutionBudget = &ExecutionBudgetSpec{IdleTimeoutSeconds: -1}
+	if err := engine.Create(invalid, "create-invalid"); err == nil {
+		t.Fatal("negative execution budget should be rejected")
+	}
+}
+
 func TestVersionConflictRejectsConcurrentWriter(t *testing.T) {
 	store := NewMemoryEventStore()
 	engine := NewEngine(store)
