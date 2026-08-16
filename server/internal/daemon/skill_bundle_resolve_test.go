@@ -242,11 +242,105 @@ func TestEnsureTaskSkillBundles_ResolvesCacheMissesConcurrently(t *testing.T) {
 	mu.Lock()
 	gotMax := maxInFlight
 	mu.Unlock()
-	if gotMax < 2 {
-		t.Fatalf("maximum concurrent skill downloads = %d, want at least 2; first-run latency is still serial", gotMax)
+	if gotMax != maxConcurrentSkillBundleResolves {
+		t.Fatalf("maximum concurrent skill downloads = %d, want production limit %d", gotMax, maxConcurrentSkillBundleResolves)
 	}
 	if len(task.Agent.Skills) != skillCount {
 		t.Fatalf("resolved skills = %d, want %d", len(task.Agent.Skills), skillCount)
+	}
+}
+
+// TestEnsureTaskSkillBundles_CapsAggregateDaemonConcurrency drives two large
+// tasks through the same daemon. Per-task concurrency is intentionally set
+// above production so this test isolates the daemon-wide safety net: a queue
+// burst must never multiply task-local fan-out into an unbounded request storm.
+func TestEnsureTaskSkillBundles_CapsAggregateDaemonConcurrency(t *testing.T) {
+	const skillsPerTask = 20
+
+	var mu sync.Mutex
+	inFlight := 0
+	maxInFlight := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Skills []SkillRefData `json:"skills"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Skills) != 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		mu.Lock()
+		inFlight++
+		if inFlight > maxInFlight {
+			maxInFlight = inFlight
+		}
+		mu.Unlock()
+		time.Sleep(75 * time.Millisecond)
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+
+		id := req.Skills[0].ID
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"bundles": []SkillData{makeResolvableSkillBundle(id)}})
+	}))
+	defer srv.Close()
+
+	d := &Daemon{client: NewClient(srv.URL), skillCache: NewSkillBundleCache(t.TempDir())}
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for taskIndex := 0; taskIndex < 2; taskIndex++ {
+		refs := make([]SkillRefData, 0, skillsPerTask)
+		for skillIndex := 0; skillIndex < skillsPerTask; skillIndex++ {
+			id := fmt.Sprintf("task-%d-skill-%d", taskIndex, skillIndex)
+			refs = append(refs, skillRefFromBundle(makeResolvableSkillBundle(id)))
+		}
+		task := &Task{
+			ID:          fmt.Sprintf("task-%d", taskIndex),
+			RuntimeID:   "rt-1",
+			WorkspaceID: fmt.Sprintf("ws-%d", taskIndex),
+			Agent:       &AgentData{ID: "agent-1", SkillRefs: refs},
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- d.ensureTaskSkillBundlesWithConcurrency(context.Background(), task, skillsPerTask)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("ensureTaskSkillBundlesWithConcurrency: %v", err)
+		}
+	}
+
+	mu.Lock()
+	gotMax := maxInFlight
+	mu.Unlock()
+	if gotMax > maxConcurrentSkillBundleResolvesPerDaemon {
+		t.Fatalf("aggregate concurrent skill downloads = %d, want <= %d", gotMax, maxConcurrentSkillBundleResolvesPerDaemon)
+	}
+	if gotMax < maxConcurrentSkillBundleResolvesPerDaemon-2 {
+		t.Fatalf("aggregate concurrent skill downloads = %d, want the global limiter to be exercised", gotMax)
+	}
+}
+
+func TestAcquireSkillBundleResolveSlotHonorsCancellation(t *testing.T) {
+	d := &Daemon{skillResolveSlots: make(chan struct{}, 1)}
+	d.skillResolveSlots <- struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	release, err := d.acquireSkillBundleResolveSlot(ctx)
+	if release != nil {
+		t.Fatal("cancelled slot acquisition returned a release function")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("slot acquisition error = %v, want context.Canceled", err)
+	}
+	if got := len(d.skillResolveSlots); got != 1 {
+		t.Fatalf("held slot count = %d, want 1; cancellation must not consume or release another task's slot", got)
 	}
 }
 
@@ -261,7 +355,7 @@ func BenchmarkEnsureTaskSkillBundlesScaling(b *testing.B) {
 			concurrency int
 		}{
 			{name: "serial", concurrency: 1},
-			{name: "bounded-4", concurrency: maxConcurrentSkillBundleResolves},
+			{name: "bounded-8", concurrency: maxConcurrentSkillBundleResolves},
 		} {
 			b.Run(fmt.Sprintf("skills=%d/%s", skillCount, variant.name), func(b *testing.B) {
 				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

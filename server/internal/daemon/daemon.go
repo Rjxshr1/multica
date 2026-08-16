@@ -76,11 +76,16 @@ const (
 	// intentionally independent from AgentTimeout, which only governs the
 	// provider process after the task reaches running.
 	defaultTaskPrepareTimeout = 5 * time.Minute
-	// maxConcurrentSkillBundleResolves bounds first-run skill downloads. Each
-	// bundle still has its own deadline, validation, and cache entry; the limit
-	// removes the N×RTT serial launch penalty without allowing an agent with a
-	// large skill set to fan out an unbounded number of requests.
-	maxConcurrentSkillBundleResolves = 4
+	// maxConcurrentSkillBundleResolves bounds first-run skill downloads for one
+	// task. Eight lanes turn 16 cold skills into two network waves on a high-RTT
+	// link; the daemon-wide limiter below prevents several simultaneous tasks
+	// from multiplying that fan-out without bound.
+	maxConcurrentSkillBundleResolves = 8
+	// maxConcurrentSkillBundleResolvesPerDaemon caps aggregate download fan-out
+	// across every task owned by this daemon. It is deliberately larger than the
+	// per-task limit so two user-visible launches can progress together, while a
+	// queue burst cannot open 8*N requests against the server.
+	maxConcurrentSkillBundleResolvesPerDaemon = 16
 	// pendingWorkHeartbeatTimeout bounds the out-of-band heartbeat a
 	// server-pushed daemon:pending_work hint triggers (MUL-5444). Short on
 	// purpose: the hint is only a latency optimisation, and the scheduled
@@ -350,6 +355,11 @@ type Daemon struct {
 	repoCache  repoCacheBackend
 	skillCache *SkillBundleCache
 	logger     *slog.Logger
+	// skillResolveSlots is initialized lazily because many focused tests build a
+	// zero-valued Daemon instead of calling New. The channel is a process-local
+	// semaphore shared by every task on this daemon.
+	skillResolveSlotsOnce sync.Once
+	skillResolveSlots     chan struct{}
 
 	mu           sync.Mutex
 	workspaces   map[string]*workspaceState
@@ -5861,6 +5871,20 @@ func (d *Daemon) ensureTaskSkillBundles(ctx context.Context, task *Task) error {
 	return d.ensureTaskSkillBundlesWithConcurrency(ctx, task, maxConcurrentSkillBundleResolves)
 }
 
+func (d *Daemon) acquireSkillBundleResolveSlot(ctx context.Context) (func(), error) {
+	d.skillResolveSlotsOnce.Do(func() {
+		if d.skillResolveSlots == nil {
+			d.skillResolveSlots = make(chan struct{}, maxConcurrentSkillBundleResolvesPerDaemon)
+		}
+	})
+	select {
+	case d.skillResolveSlots <- struct{}{}:
+		return func() { <-d.skillResolveSlots }, nil
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	}
+}
+
 // ensureTaskSkillBundlesWithConcurrency is split from the production wrapper
 // so the latency harness can compare the old serial path (limit=1) with the
 // bounded path using the exact same download, validation, and caching code.
@@ -5911,6 +5935,14 @@ func (d *Daemon) ensureTaskSkillBundlesWithConcurrency(ctx context.Context, task
 		i, ref := i, ref
 		resolveGroup.Go(func() error {
 			started := time.Now()
+			release, err := d.acquireSkillBundleResolveSlot(ctx)
+			if err != nil {
+				resolveErrs[i] = fmt.Errorf("%w: skill %q (id=%s, %d bytes) after %s: %w",
+					errSkillBundleUnavailable, ref.Name, ref.ID, ref.SizeBytes,
+					time.Since(started).Round(time.Millisecond), err)
+				return nil
+			}
+			defer release()
 			bundle, err := d.resolveSkillBundle(ctx, task, ref)
 			if err != nil {
 				// Name the skill, its declared size, and how long we actually
