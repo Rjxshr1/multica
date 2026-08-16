@@ -183,7 +183,7 @@ func TestEnsureTaskSkillBundles_CachesEachSuccessAcrossDispatches(t *testing.T) 
 // cache misses must not be downloaded serially: first-run prepare latency
 // would otherwise grow by one full network RTT per skill.
 func TestEnsureTaskSkillBundles_ResolvesCacheMissesConcurrently(t *testing.T) {
-	const skillCount = 8
+	const skillCount = 64
 
 	var mu sync.Mutex
 	inFlight := 0
@@ -349,7 +349,7 @@ func TestAcquireSkillBundleResolveSlotHonorsCancellation(t *testing.T) {
 // skill counts. The server injects a fixed 10 ms RTT per bundle; all other
 // code (HTTP, validation, cache persistence, and result ordering) is real.
 func BenchmarkEnsureTaskSkillBundlesScaling(b *testing.B) {
-	for _, skillCount := range []int{1, 4, 8, 16} {
+	for _, skillCount := range []int{1, 4, 8, 16, 32, 64} {
 		for _, variant := range []struct {
 			name        string
 			concurrency int
