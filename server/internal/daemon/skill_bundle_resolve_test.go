@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -172,6 +173,131 @@ func TestEnsureTaskSkillBundles_CachesEachSuccessAcrossDispatches(t *testing.T) 
 	for i, id := range ids {
 		if task.Agent.Skills[i].ID != id {
 			t.Errorf("dispatch 2: skill[%d].ID = %q, want %q", i, task.Agent.Skills[i].ID, id)
+		}
+	}
+}
+
+// TestEnsureTaskSkillBundles_ResolvesCacheMissesConcurrently is the launch
+// latency regression for agents with many assigned skills. Each bundle keeps
+// its own request, deadline, validation, and cache entry, but independent
+// cache misses must not be downloaded serially: first-run prepare latency
+// would otherwise grow by one full network RTT per skill.
+func TestEnsureTaskSkillBundles_ResolvesCacheMissesConcurrently(t *testing.T) {
+	const skillCount = 8
+
+	var mu sync.Mutex
+	inFlight := 0
+	maxInFlight := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Skills []SkillRefData `json:"skills"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if len(req.Skills) != 1 {
+			t.Errorf("expected one skill per independently cached request, got %d", len(req.Skills))
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		mu.Lock()
+		inFlight++
+		if inFlight > maxInFlight {
+			maxInFlight = inFlight
+		}
+		mu.Unlock()
+
+		// A fixed RTT makes the old serial behaviour observable without relying
+		// on a brittle total-duration threshold.
+		time.Sleep(30 * time.Millisecond)
+
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+
+		id := req.Skills[0].ID
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"bundles": []SkillData{makeResolvableSkillBundle(id)}})
+	}))
+	defer srv.Close()
+
+	refs := make([]SkillRefData, 0, skillCount)
+	for i := 0; i < skillCount; i++ {
+		refs = append(refs, skillRefFromBundle(makeResolvableSkillBundle(fmt.Sprintf("skill-%d", i))))
+	}
+	d := &Daemon{client: NewClient(srv.URL), skillCache: NewSkillBundleCache(t.TempDir())}
+	task := &Task{
+		ID:          "task-many-skills",
+		RuntimeID:   "rt-1",
+		WorkspaceID: "ws-1",
+		Agent:       &AgentData{ID: "agent-1", SkillRefs: refs},
+	}
+
+	if err := d.ensureTaskSkillBundles(context.Background(), task); err != nil {
+		t.Fatalf("ensureTaskSkillBundles: %v", err)
+	}
+	mu.Lock()
+	gotMax := maxInFlight
+	mu.Unlock()
+	if gotMax < 2 {
+		t.Fatalf("maximum concurrent skill downloads = %d, want at least 2; first-run latency is still serial", gotMax)
+	}
+	if len(task.Agent.Skills) != skillCount {
+		t.Fatalf("resolved skills = %d, want %d", len(task.Agent.Skills), skillCount)
+	}
+}
+
+// BenchmarkEnsureTaskSkillBundlesScaling compares the former serial download
+// policy with the production bounded-concurrency policy across increasing
+// skill counts. The server injects a fixed 10 ms RTT per bundle; all other
+// code (HTTP, validation, cache persistence, and result ordering) is real.
+func BenchmarkEnsureTaskSkillBundlesScaling(b *testing.B) {
+	for _, skillCount := range []int{1, 4, 8, 16} {
+		for _, variant := range []struct {
+			name        string
+			concurrency int
+		}{
+			{name: "serial", concurrency: 1},
+			{name: "bounded-4", concurrency: maxConcurrentSkillBundleResolves},
+		} {
+			b.Run(fmt.Sprintf("skills=%d/%s", skillCount, variant.name), func(b *testing.B) {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					var req struct {
+						Skills []SkillRefData `json:"skills"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Skills) != 1 {
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+					id := req.Skills[0].ID
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{"bundles": []SkillData{makeResolvableSkillBundle(id)}})
+				}))
+				defer srv.Close()
+
+				refs := make([]SkillRefData, 0, skillCount)
+				for i := 0; i < skillCount; i++ {
+					refs = append(refs, skillRefFromBundle(makeResolvableSkillBundle(fmt.Sprintf("skill-%d", i))))
+				}
+				d := &Daemon{client: NewClient(srv.URL), skillCache: NewSkillBundleCache(b.TempDir())}
+
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					task := &Task{
+						ID:          fmt.Sprintf("task-%d", i),
+						RuntimeID:   "rt-1",
+						WorkspaceID: fmt.Sprintf("ws-%d", i),
+						Agent:       &AgentData{ID: "agent-1", SkillRefs: refs},
+					}
+					if err := d.ensureTaskSkillBundlesWithConcurrency(context.Background(), task, variant.concurrency); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
 		}
 	}
 }

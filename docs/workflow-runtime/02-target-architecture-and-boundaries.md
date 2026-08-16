@@ -28,6 +28,7 @@ flowchart TB
         RED["Deterministic Reducer"]
         RUN["WorkflowRun / NodeExecution / Dependency"]
         ATT["Attempt / Artifact / Verification"]
+        CTX["Context Snapshot / Read-only Gateway"]
         EVT["Event Log / Transactional Outbox"]
         PROJ["Issue / Comment Projection"]
     end
@@ -44,10 +45,12 @@ flowchart TB
     API --> RED
     RED --> RUN
     RED --> ATT
+    ATT --> CTX
     RED --> EVT
     ATT -->|"事务化创建并绑定 Task"| TQ
     TQ --> RT
     RT -->|"Result / Artifact"| API
+    RT -->|"按需只读查询"| CTX
     ATT -->|"独立 Verification Task"| TQ
     TQ --> REC
     EVT --> PROJ
@@ -105,6 +108,7 @@ Issue done 不是 Workflow verification
 | Idempotency key | HTTP 重试、worker 重投和重复 callback 不得产生第二个状态变化 |
 | Issue/Comment projection | 兼容现有 UI，但保证投影永远不是权威 |
 | Reconciler | 根据结构化事实收敛，不再从自然语言推理世界状态 |
+| Context Snapshot / Gateway | Attempt 必须看到稳定、可审计且受租户边界保护的上下文；不能由上层每次临时拼接完整历史 |
 
 ### 3.3 直接复用 Multica 已有能力
 
@@ -119,6 +123,16 @@ Issue done 不是 Workflow verification
 | Autopilot schedule/webhook | 可作为 Run 创建触发源，不充当 Workflow reducer |
 | Event Bus / WebSocket | 由 Outbox publisher 驱动 UI 更新 |
 | Workspace、membership、tenant guards | 所有 Workflow 表和命令继承同一租户边界 |
+
+### 3.4 上下文工程的边界
+
+| 层 | 负责什么 |
+|---|---|
+| Workflow Studio | 决定哪些资料属于当前任务、L0 需要哪些字段，以及 Agent 何时应主动查询 |
+| Multica Workflow Runtime | 创建不可变 Task/Attempt 快照，维护目录、revision 和 digest，并提供 task-scoped 只读查询 |
+| Agent/Daemon | 默认消费 L0；需要前置结果、历史执行、验证或产物时调用查询接口；同一 Issue 尽量复用 Session |
+
+默认 Prompt 只注入 `task/current` 与 `workflow/overview`。其他内容不丢弃，而是保存在快照目录中，通过 `context_catalog`、`context_search`、`context_get` 和 `context_dependency` 按需获取。每个 Attempt 始终绑定同一个快照版本，因此节省上下文不能以牺牲状态一致性为代价。
 
 ## 4. 运行时唯一权威
 

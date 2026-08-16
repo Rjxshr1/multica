@@ -6079,3 +6079,50 @@ func TestEnvironmentCleanupStandardModeRemovesWorkdir(t *testing.T) {
 		t.Fatalf("output/ removed by partial cleanup: %v", err)
 	}
 }
+
+// BenchmarkPrepareSkillScaling isolates Multica's task-environment and skill
+// materialization cost from model inference. Skill bodies and supporting files
+// use realistic text sizes; the benchmark exercises the real Prepare and
+// cleanup paths for Pi's provider-native .pi/skills layout.
+func BenchmarkPrepareSkillScaling(b *testing.B) {
+	for _, skillCount := range []int{0, 8, 32, 64} {
+		b.Run(fmt.Sprintf("skills=%d", skillCount), func(b *testing.B) {
+			skills := make([]SkillContextForEnv, 0, skillCount)
+			for i := 0; i < skillCount; i++ {
+				skills = append(skills, SkillContextForEnv{
+					Name:        fmt.Sprintf("skill-%03d", i),
+					Description: "Benchmark skill for launch preparation.",
+					Content:     strings.Repeat("instruction line\n", 512),
+					Files: []SkillFileContextForEnv{
+						{Path: "references/guide.md", Content: strings.Repeat("reference\n", 256)},
+						{Path: "templates/check.md", Content: strings.Repeat("check\n", 256)},
+					},
+				})
+			}
+
+			root := b.TempDir()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				env, err := Prepare(PrepareParams{
+					WorkspacesRoot: root,
+					WorkspaceID:    "ws-benchmark",
+					TaskID:         fmt.Sprintf("%08d-0000-0000-0000-000000000000", i),
+					Provider:       "pi",
+					AgentName:      "Benchmark Agent",
+					Task: TaskContextForEnv{
+						IssueID:     "issue-benchmark",
+						AgentID:     "agent-benchmark",
+						AgentName:   "Benchmark Agent",
+						AgentSkills: skills,
+					},
+				}, discardLogger())
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := env.Cleanup(true); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

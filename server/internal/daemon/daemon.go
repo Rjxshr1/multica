@@ -76,6 +76,11 @@ const (
 	// intentionally independent from AgentTimeout, which only governs the
 	// provider process after the task reaches running.
 	defaultTaskPrepareTimeout = 5 * time.Minute
+	// maxConcurrentSkillBundleResolves bounds first-run skill downloads. Each
+	// bundle still has its own deadline, validation, and cache entry; the limit
+	// removes the N×RTT serial launch penalty without allowing an agent with a
+	// large skill set to fan out an unbounded number of requests.
+	maxConcurrentSkillBundleResolves = 4
 	// pendingWorkHeartbeatTimeout bounds the out-of-band heartbeat a
 	// server-pushed daemon:pending_work hint triggers (MUL-5444). Short on
 	// purpose: the hint is only a latency optimisation, and the scheduled
@@ -5853,8 +5858,18 @@ func waitCodexRolloutPresent(ctx context.Context, codexHome, sessionID string) b
 }
 
 func (d *Daemon) ensureTaskSkillBundles(ctx context.Context, task *Task) error {
+	return d.ensureTaskSkillBundlesWithConcurrency(ctx, task, maxConcurrentSkillBundleResolves)
+}
+
+// ensureTaskSkillBundlesWithConcurrency is split from the production wrapper
+// so the latency harness can compare the old serial path (limit=1) with the
+// bounded path using the exact same download, validation, and caching code.
+func (d *Daemon) ensureTaskSkillBundlesWithConcurrency(ctx context.Context, task *Task, concurrency int) error {
 	if task == nil || task.Agent == nil || len(task.Agent.SkillRefs) == 0 {
 		return nil
+	}
+	if concurrency < 1 {
+		concurrency = 1
 	}
 	resolved := make(map[string]SkillData, len(task.Agent.SkillRefs))
 	misses := make([]SkillRefData, 0)
@@ -5884,21 +5899,42 @@ func (d *Daemon) ensureTaskSkillBundles(ctx context.Context, task *Task) error {
 	// size-scaled deadline and is persisted independently, so even a dispatch
 	// that ultimately fails leaves the skills it did fetch cached for the next
 	// one. (GitHub #4505 / MUL-3650)
-	for _, ref := range misses {
-		started := time.Now()
-		bundle, err := d.resolveSkillBundle(ctx, task, ref)
+	// Resolve independent cache misses with bounded concurrency. Keep errors in
+	// claim order and wait for every started download: a later failure must not
+	// cancel earlier successes, because each successful bundle is useful cache
+	// progress for the next dispatch (GitHub #4505 / MUL-3650).
+	var resolvedMu sync.Mutex
+	resolveErrs := make([]error, len(misses))
+	var resolveGroup errgroup.Group
+	resolveGroup.SetLimit(concurrency)
+	for i, ref := range misses {
+		i, ref := i, ref
+		resolveGroup.Go(func() error {
+			started := time.Now()
+			bundle, err := d.resolveSkillBundle(ctx, task, ref)
+			if err != nil {
+				// Name the skill, its declared size, and how long we actually
+				// waited. The bare "resolve skill bundles: context deadline
+				// exceeded" this replaced was indistinguishable from a generic
+				// network fault, and cost a community thread three hours of
+				// guesswork (MUL-5370): size + elapsed separate "this bundle is
+				// too big for the link" from "the link is dead".
+				resolveErrs[i] = fmt.Errorf("%w: skill %q (id=%s, %d bytes) after %s: %w",
+					errSkillBundleUnavailable, ref.Name, ref.ID, ref.SizeBytes,
+					time.Since(started).Round(time.Millisecond), err)
+				return nil
+			}
+			resolvedMu.Lock()
+			resolved[skillRefKey(bundle.Source, bundle.ID)] = bundle
+			resolvedMu.Unlock()
+			return nil
+		})
+	}
+	_ = resolveGroup.Wait()
+	for _, err := range resolveErrs {
 		if err != nil {
-			// Name the skill, its declared size, and how long we actually
-			// waited. The bare "resolve skill bundles: context deadline
-			// exceeded" this replaced was indistinguishable from a generic
-			// network fault, and cost a community thread three hours of
-			// guesswork (MUL-5370): size + elapsed separate "this bundle is
-			// too big for the link" from "the link is dead".
-			return fmt.Errorf("%w: skill %q (id=%s, %d bytes) after %s: %w",
-				errSkillBundleUnavailable, ref.Name, ref.ID, ref.SizeBytes,
-				time.Since(started).Round(time.Millisecond), err)
+			return err
 		}
-		resolved[skillRefKey(bundle.Source, bundle.ID)] = bundle
 	}
 
 	skills := make([]SkillData, 0, len(task.Agent.SkillRefs))
@@ -6084,6 +6120,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if task.WorkspaceID == "" {
 		return TaskResult{}, fmt.Errorf("refusing to spawn agent: task has no workspace_id (task_id=%s)", task.ID)
 	}
+	launchStarted := time.Now()
 
 	prepareTimeout := d.effectiveTaskPrepareTimeout()
 	prepareCtx, cancelPrepare := context.WithTimeoutCause(ctx, prepareTimeout, errTaskPrepareTimeout)
@@ -6151,13 +6188,16 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if !ok {
 		return TaskResult{}, fmt.Errorf("no agent configured for provider %q", provider)
 	}
+	runtimeResolveDuration := time.Since(launchStarted)
 
 	stopPrepareLease := d.startTaskPrepareLeaseExtender(prepareCtx, task, taskLog)
 	defer stopPrepareLease()
 
+	skillResolveStarted := time.Now()
 	if err := d.ensureTaskSkillBundles(prepareCtx, &task); err != nil {
 		return TaskResult{}, err
 	}
+	skillResolveDuration := time.Since(skillResolveStarted)
 
 	agentName := "agent"
 	var agentID string
@@ -6264,6 +6304,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	var agentMcpConfig json.RawMessage
 	var effectiveMcpConfig json.RawMessage
 	var cursorMcpAuthSource string
+	remoteMCPStarted := time.Now()
 	remoteMCPConfig, remoteMCPDiagnostics, remoteMCPBrokers, remoteMCPErr := startTaskRemoteMCPBrokers(
 		prepareCtx, ctx, task.ID, provider, task.RemoteMCPConnections,
 		func(resolveCtx context.Context, contributionID string) (http.Header, error) {
@@ -6274,6 +6315,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if remoteMCPErr != nil {
 		return TaskResult{}, fmt.Errorf("prepare Remote MCP broker: %w", remoteMCPErr)
 	}
+	remoteMCPDuration := time.Since(remoteMCPStarted)
 	if remoteMCPBrokers != nil {
 		defer remoteMCPBrokers.Close()
 	}
@@ -6413,6 +6455,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			defer d.unmarkActiveStore(store)
 		}
 	}
+	envPrepareStarted := time.Now()
 	envReused := false
 	if shouldReusePriorWorkdir(task, localAssignment, d.cfg.WorkspacesRoot) {
 		var err error
@@ -6544,6 +6587,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			}
 		}
 	}
+	envPrepareDuration := time.Since(envPrepareStarted)
 	// Belt-and-suspenders: also mark whatever root we ended up with, in case
 	// future changes diverge from PredictRootDir.
 	if env.RootDir != predictedRoot && env.RootDir != "" {
@@ -6675,10 +6719,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// taskfailure.Classify path records the failure with the same
 	// "start task failed: <…>" string and the same failure_reason
 	// taxonomy as before — see MUL-2946 for the classifier contract.
+	startTaskStarted := time.Now()
 	if err := d.client.StartTask(prepareCtx, task.ID); err != nil {
 		stopPrepareLease()
 		return TaskResult{}, fmt.Errorf("start task failed: %w", err)
 	}
+	startTaskDuration := time.Since(startTaskStarted)
 	stopPrepareLease()
 	prepareComplete = true
 	cancelPrepare()
@@ -6694,6 +6740,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		gateCodexResumeToRolloutPresence(&task, &taskCtx, provider, env.CodexHome, taskLog)
 	}
 
+	backendSetupStarted := time.Now()
 	// Inject runtime-specific config (meta skill) so the agent discovers .agent_context/.
 	runtimeBrief, err := execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx)
 	if err != nil {
@@ -7017,6 +7064,18 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		"resume_session", execOpts.ResumeSessionID != "",
 		"timeout", execOpts.Timeout,
 		"idle_watchdog", execOpts.IdleWatchdogTimeout,
+	)
+	taskLog.Info("task launch phases",
+		"runtime_resolve_ms", runtimeResolveDuration.Milliseconds(),
+		"skill_resolve_ms", skillResolveDuration.Milliseconds(),
+		"remote_mcp_ms", remoteMCPDuration.Milliseconds(),
+		"env_prepare_ms", envPrepareDuration.Milliseconds(),
+		"start_task_rpc_ms", startTaskDuration.Milliseconds(),
+		"backend_setup_ms", time.Since(backendSetupStarted).Milliseconds(),
+		"ready_to_execute_ms", time.Since(launchStarted).Milliseconds(),
+		"skill_count", len(skills),
+		"env_reused", envReused,
+		"session_resumed", execOpts.ResumeSessionID != "",
 	)
 
 	// Shared across the resume-retry below so the retry's transcript rows
@@ -7534,6 +7593,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	agentCtx, agentCancel := context.WithCancel(ctx)
 	defer agentCancel()
 
+	backendExecuteStarted := time.Now()
 	session, err := backend.Execute(agentCtx, prompt, opts)
 	if err != nil {
 		// One provider-agnostic boundary for launches: every backend's
@@ -7544,6 +7604,8 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 		taskLog.Debug("backend execute returned error", "error", err)
 		return agent.Result{}, 0, err
 	}
+	backendStartedAt := time.Now()
+	taskLog.Info("agent process started", "backend_start_ms", backendStartedAt.Sub(backendExecuteStarted).Milliseconds())
 	// This counter intentionally starts at the narrower provider-session
 	// boundary, not at the earlier server-side StartTask transition.
 	d.runningTasks.Add(1)
@@ -7610,6 +7672,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 		var pendingThinking strings.Builder
 		var batch []TaskMessageData
 		callIDToTool := map[string]string{}
+		var firstSemanticActivity sync.Once
 
 		flush := func() {
 			mu.Lock()
@@ -7676,6 +7739,15 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 				// slow downstream call (mu.Lock contention, batch resize)
 				// can't be misattributed to backend silence.
 				lastActivityAt.Store(time.Now().UnixNano())
+				if msg.Type != agent.MessageStatus {
+					firstSemanticActivity.Do(func() {
+						taskLog.Info("agent first semantic activity",
+							"after_process_start_ms", time.Since(backendStartedAt).Milliseconds(),
+							"after_execute_call_ms", time.Since(backendExecuteStarted).Milliseconds(),
+							"message_type", msg.Type,
+						)
+					})
+				}
 				switch msg.Type {
 				case agent.MessageStatus:
 					// Persist the session/work_dir as soon as the backend
