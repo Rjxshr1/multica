@@ -430,8 +430,11 @@ func (s *WorkflowRuntimeService) BindTask(ctx context.Context, workspaceID pgtyp
 		if _, err := qtx.SetAgentTaskWorkflowRetryOwnership(ctx, taskID); err != nil {
 			return fmt.Errorf("bind workflow task retry ownership: %w", err)
 		}
-		_, err := qtx.BindWorkflowAttemptTask(ctx, db.BindWorkflowAttemptTaskParams{TaskID: taskID, ID: lease.AttemptID, RunID: lease.RunID, WorkspaceID: workspaceID})
-		return err
+		attempt, err := qtx.BindWorkflowAttemptTask(ctx, db.BindWorkflowAttemptTaskParams{TaskID: taskID, ID: lease.AttemptID, RunID: lease.RunID, WorkspaceID: workspaceID})
+		if err != nil {
+			return err
+		}
+		return s.createContextSnapshotTx(ctx, qtx, attempt, taskID)
 	})
 }
 

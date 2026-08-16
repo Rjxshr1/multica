@@ -272,6 +272,117 @@ func (q *Queries) CreateWorkflowAttempt(ctx context.Context, arg CreateWorkflowA
 	return i, err
 }
 
+const createWorkflowContextItem = `-- name: CreateWorkflowContextItem :one
+INSERT INTO workflow_context_item (
+    id, workspace_id, snapshot_id, ordinal, reference_key, kind, title,
+    content, search_text, source_type, source_id, source_digest
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7,
+    $8, $9, $10, $11, $12
+)
+RETURNING id, workspace_id, snapshot_id, ordinal, reference_key, kind, title, content, search_text, source_type, source_id, source_digest, created_at
+`
+
+type CreateWorkflowContextItemParams struct {
+	ID           pgtype.UUID `json:"id"`
+	WorkspaceID  pgtype.UUID `json:"workspace_id"`
+	SnapshotID   pgtype.UUID `json:"snapshot_id"`
+	Ordinal      int32       `json:"ordinal"`
+	ReferenceKey string      `json:"reference_key"`
+	Kind         string      `json:"kind"`
+	Title        string      `json:"title"`
+	Content      []byte      `json:"content"`
+	SearchText   string      `json:"search_text"`
+	SourceType   string      `json:"source_type"`
+	SourceID     pgtype.UUID `json:"source_id"`
+	SourceDigest string      `json:"source_digest"`
+}
+
+func (q *Queries) CreateWorkflowContextItem(ctx context.Context, arg CreateWorkflowContextItemParams) (WorkflowContextItem, error) {
+	row := q.db.QueryRow(ctx, createWorkflowContextItem,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.SnapshotID,
+		arg.Ordinal,
+		arg.ReferenceKey,
+		arg.Kind,
+		arg.Title,
+		arg.Content,
+		arg.SearchText,
+		arg.SourceType,
+		arg.SourceID,
+		arg.SourceDigest,
+	)
+	var i WorkflowContextItem
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.SnapshotID,
+		&i.Ordinal,
+		&i.ReferenceKey,
+		&i.Kind,
+		&i.Title,
+		&i.Content,
+		&i.SearchText,
+		&i.SourceType,
+		&i.SourceID,
+		&i.SourceDigest,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const createWorkflowContextSnapshot = `-- name: CreateWorkflowContextSnapshot :one
+INSERT INTO workflow_context_snapshot (
+    id, workspace_id, run_id, node_id, attempt_id, task_id,
+    run_revision, digest, manifest
+) VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9
+)
+RETURNING id, workspace_id, run_id, node_id, attempt_id, task_id, run_revision, digest, manifest, created_at
+`
+
+type CreateWorkflowContextSnapshotParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	RunID       pgtype.UUID `json:"run_id"`
+	NodeID      pgtype.UUID `json:"node_id"`
+	AttemptID   pgtype.UUID `json:"attempt_id"`
+	TaskID      pgtype.UUID `json:"task_id"`
+	RunRevision int64       `json:"run_revision"`
+	Digest      string      `json:"digest"`
+	Manifest    []byte      `json:"manifest"`
+}
+
+func (q *Queries) CreateWorkflowContextSnapshot(ctx context.Context, arg CreateWorkflowContextSnapshotParams) (WorkflowContextSnapshot, error) {
+	row := q.db.QueryRow(ctx, createWorkflowContextSnapshot,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.RunID,
+		arg.NodeID,
+		arg.AttemptID,
+		arg.TaskID,
+		arg.RunRevision,
+		arg.Digest,
+		arg.Manifest,
+	)
+	var i WorkflowContextSnapshot
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.RunID,
+		&i.NodeID,
+		&i.AttemptID,
+		&i.TaskID,
+		&i.RunRevision,
+		&i.Digest,
+		&i.Manifest,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const createWorkflowDependency = `-- name: CreateWorkflowDependency :one
 INSERT INTO workflow_node_dependency (
     id, workspace_id, run_id, predecessor_node_id, successor_node_id, condition
@@ -525,7 +636,9 @@ func (q *Queries) DeleteWorkflowDependenciesForSuccessor(ctx context.Context, ar
 }
 
 const deleteWorkspaceWorkflowRuntime = `-- name: DeleteWorkspaceWorkflowRuntime :exec
-WITH deleted_outbox AS (DELETE FROM workflow_outbox WHERE workspace_id = $1),
+WITH deleted_context_items AS (DELETE FROM workflow_context_item WHERE workspace_id = $1),
+deleted_context_snapshots AS (DELETE FROM workflow_context_snapshot WHERE workspace_id = $1),
+deleted_outbox AS (DELETE FROM workflow_outbox WHERE workspace_id = $1),
 deleted_events AS (DELETE FROM workflow_event WHERE workspace_id = $1),
 deleted_verifications AS (DELETE FROM workflow_verification WHERE workspace_id = $1),
 deleted_artifacts AS (DELETE FROM workflow_artifact WHERE workspace_id = $1),
@@ -813,6 +926,113 @@ func (q *Queries) GetWorkflowAttemptByTaskForUpdate(ctx context.Context, taskID 
 	return i, err
 }
 
+const getWorkflowContextBootstrapItems = `-- name: GetWorkflowContextBootstrapItems :many
+SELECT id, workspace_id, snapshot_id, ordinal, reference_key, kind, title, content, search_text, source_type, source_id, source_digest, created_at FROM workflow_context_item
+WHERE snapshot_id = $1 AND workspace_id = $2
+  AND reference_key IN ('task/current', 'workflow/overview')
+ORDER BY ordinal
+`
+
+type GetWorkflowContextBootstrapItemsParams struct {
+	SnapshotID  pgtype.UUID `json:"snapshot_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) GetWorkflowContextBootstrapItems(ctx context.Context, arg GetWorkflowContextBootstrapItemsParams) ([]WorkflowContextItem, error) {
+	rows, err := q.db.Query(ctx, getWorkflowContextBootstrapItems, arg.SnapshotID, arg.WorkspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WorkflowContextItem{}
+	for rows.Next() {
+		var i WorkflowContextItem
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.SnapshotID,
+			&i.Ordinal,
+			&i.ReferenceKey,
+			&i.Kind,
+			&i.Title,
+			&i.Content,
+			&i.SearchText,
+			&i.SourceType,
+			&i.SourceID,
+			&i.SourceDigest,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const getWorkflowContextItemByReference = `-- name: GetWorkflowContextItemByReference :one
+SELECT id, workspace_id, snapshot_id, ordinal, reference_key, kind, title, content, search_text, source_type, source_id, source_digest, created_at FROM workflow_context_item
+WHERE snapshot_id = $1 AND workspace_id = $2
+  AND reference_key = $3
+`
+
+type GetWorkflowContextItemByReferenceParams struct {
+	SnapshotID   pgtype.UUID `json:"snapshot_id"`
+	WorkspaceID  pgtype.UUID `json:"workspace_id"`
+	ReferenceKey string      `json:"reference_key"`
+}
+
+func (q *Queries) GetWorkflowContextItemByReference(ctx context.Context, arg GetWorkflowContextItemByReferenceParams) (WorkflowContextItem, error) {
+	row := q.db.QueryRow(ctx, getWorkflowContextItemByReference, arg.SnapshotID, arg.WorkspaceID, arg.ReferenceKey)
+	var i WorkflowContextItem
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.SnapshotID,
+		&i.Ordinal,
+		&i.ReferenceKey,
+		&i.Kind,
+		&i.Title,
+		&i.Content,
+		&i.SearchText,
+		&i.SourceType,
+		&i.SourceID,
+		&i.SourceDigest,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getWorkflowContextSnapshotByTask = `-- name: GetWorkflowContextSnapshotByTask :one
+SELECT id, workspace_id, run_id, node_id, attempt_id, task_id, run_revision, digest, manifest, created_at FROM workflow_context_snapshot
+WHERE task_id = $1 AND workspace_id = $2
+`
+
+type GetWorkflowContextSnapshotByTaskParams struct {
+	TaskID      pgtype.UUID `json:"task_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) GetWorkflowContextSnapshotByTask(ctx context.Context, arg GetWorkflowContextSnapshotByTaskParams) (WorkflowContextSnapshot, error) {
+	row := q.db.QueryRow(ctx, getWorkflowContextSnapshotByTask, arg.TaskID, arg.WorkspaceID)
+	var i WorkflowContextSnapshot
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.RunID,
+		&i.NodeID,
+		&i.AttemptID,
+		&i.TaskID,
+		&i.RunRevision,
+		&i.Digest,
+		&i.Manifest,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getWorkflowEventByIdempotencyKey = `-- name: GetWorkflowEventByIdempotencyKey :one
 SELECT id, workspace_id, run_id, sequence, aggregate_type, aggregate_id, event_type, from_state, to_state, aggregate_revision, actor_type, actor_id, attempt_id, verification_id, idempotency_key, payload, created_at FROM workflow_event
 WHERE run_id = $1 AND workspace_id = $2
@@ -1087,6 +1307,51 @@ func (q *Queries) LeaseWorkflowOutbox(ctx context.Context, arg LeaseWorkflowOutb
 	return items, nil
 }
 
+const listWorkflowArtifacts = `-- name: ListWorkflowArtifacts :many
+SELECT id, workspace_id, run_id, node_id, attempt_id, kind, uri, digest, manifest, created_by_task_id, created_by_type, created_by_id, created_at FROM workflow_artifact
+WHERE run_id = $1 AND workspace_id = $2
+ORDER BY created_at, id
+`
+
+type ListWorkflowArtifactsParams struct {
+	RunID       pgtype.UUID `json:"run_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) ListWorkflowArtifacts(ctx context.Context, arg ListWorkflowArtifactsParams) ([]WorkflowArtifact, error) {
+	rows, err := q.db.Query(ctx, listWorkflowArtifacts, arg.RunID, arg.WorkspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WorkflowArtifact{}
+	for rows.Next() {
+		var i WorkflowArtifact
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.RunID,
+			&i.NodeID,
+			&i.AttemptID,
+			&i.Kind,
+			&i.Uri,
+			&i.Digest,
+			&i.Manifest,
+			&i.CreatedByTaskID,
+			&i.CreatedByType,
+			&i.CreatedByID,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWorkflowAttempts = `-- name: ListWorkflowAttempts :many
 SELECT id, workspace_id, run_id, node_id, attempt_no, fence_token, task_id, executor_id, runtime_id, status, result_payload, result_digest, failure_code, failure_detail, deadline_at, next_retry_at, created_at, started_at, completed_at, updated_at FROM workflow_attempt
 WHERE run_id = $1 AND workspace_id = $2
@@ -1128,6 +1393,51 @@ func (q *Queries) ListWorkflowAttempts(ctx context.Context, arg ListWorkflowAtte
 			&i.StartedAt,
 			&i.CompletedAt,
 			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkflowContextItems = `-- name: ListWorkflowContextItems :many
+SELECT id, workspace_id, snapshot_id, ordinal, reference_key, kind, title, content, search_text, source_type, source_id, source_digest, created_at FROM workflow_context_item
+WHERE snapshot_id = $1 AND workspace_id = $2
+ORDER BY ordinal
+`
+
+type ListWorkflowContextItemsParams struct {
+	SnapshotID  pgtype.UUID `json:"snapshot_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) ListWorkflowContextItems(ctx context.Context, arg ListWorkflowContextItemsParams) ([]WorkflowContextItem, error) {
+	rows, err := q.db.Query(ctx, listWorkflowContextItems, arg.SnapshotID, arg.WorkspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WorkflowContextItem{}
+	for rows.Next() {
+		var i WorkflowContextItem
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.SnapshotID,
+			&i.Ordinal,
+			&i.ReferenceKey,
+			&i.Kind,
+			&i.Title,
+			&i.Content,
+			&i.SearchText,
+			&i.SourceType,
+			&i.SourceID,
+			&i.SourceDigest,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1505,6 +1815,68 @@ func (q *Queries) RetryWorkflowOutbox(ctx context.Context, arg RetryWorkflowOutb
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const searchWorkflowContextItems = `-- name: SearchWorkflowContextItems :many
+SELECT id, workspace_id, snapshot_id, ordinal, reference_key, kind, title, content, search_text, source_type, source_id, source_digest, created_at FROM workflow_context_item
+WHERE snapshot_id = $1 AND workspace_id = $2
+  AND ($3::text = '' OR search_text ILIKE '%' || $3::text || '%')
+  AND (cardinality($4::text[]) = 0 OR kind = ANY($4::text[]))
+ORDER BY
+  CASE WHEN lower(title) = lower($3::text) THEN 0
+       WHEN lower(reference_key) = lower($3::text) THEN 1
+       WHEN lower(title) LIKE '%' || lower($3::text) || '%' THEN 2
+       ELSE 3 END,
+  ordinal
+LIMIT $5
+`
+
+type SearchWorkflowContextItemsParams struct {
+	SnapshotID  pgtype.UUID `json:"snapshot_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	Query       string      `json:"query"`
+	Kinds       []string    `json:"kinds"`
+	ResultLimit int32       `json:"result_limit"`
+}
+
+func (q *Queries) SearchWorkflowContextItems(ctx context.Context, arg SearchWorkflowContextItemsParams) ([]WorkflowContextItem, error) {
+	rows, err := q.db.Query(ctx, searchWorkflowContextItems,
+		arg.SnapshotID,
+		arg.WorkspaceID,
+		arg.Query,
+		arg.Kinds,
+		arg.ResultLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WorkflowContextItem{}
+	for rows.Next() {
+		var i WorkflowContextItem
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.SnapshotID,
+			&i.Ordinal,
+			&i.ReferenceKey,
+			&i.Kind,
+			&i.Title,
+			&i.Content,
+			&i.SearchText,
+			&i.SourceType,
+			&i.SourceID,
+			&i.SourceDigest,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const setAgentTaskWorkflowRetryOwnership = `-- name: SetAgentTaskWorkflowRetryOwnership :one

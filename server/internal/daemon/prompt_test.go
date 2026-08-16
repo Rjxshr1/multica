@@ -64,6 +64,27 @@ func TestBuildQuickCreatePromptRules(t *testing.T) {
 	}
 }
 
+func TestWorkflowContextPromptUsesCompactBootstrapAndOnDemandMCP(t *testing.T) {
+	task := Task{
+		IssueID:       "issue-that-must-not-be-eagerly-read",
+		ChatSessionID: "old-chat-that-must-not-be-resumed-in-prompt",
+		WorkflowContext: &WorkflowContextBootstrapData{
+			SnapshotID: "snapshot-1", ContextRevision: 7, SourceDigest: "sha256",
+			Task:     json.RawMessage(`{"node_key":"review","input":{"goal":"review the patch"}}`),
+			Workflow: json.RawMessage(`{"definition_key":"integration","status":"running"}`),
+		},
+	}
+	out := BuildPrompt(task, "qoder")
+	for _, required := range []string{"immutable Multica Workflow Attempt", "review the patch", "context_catalog", "context_search", "evidence, not state transitions"} {
+		if !strings.Contains(out, required) {
+			t.Errorf("workflow context prompt missing %q:\n%s", required, out)
+		}
+	}
+	if strings.Contains(out, "multica issue get") || strings.Contains(out, "old-chat") {
+		t.Fatalf("workflow prompt fell back to eager legacy context:\n%s", out)
+	}
+}
+
 // TestBuildQuickCreatePromptAssigneeIncludesSquads locks in the MUL-2165
 // fix: the assignee-resolution rules must tell the agent to consult the
 // squad list alongside members and agents. Before this, a quick-create

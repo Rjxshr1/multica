@@ -134,6 +134,59 @@ SELECT * FROM workflow_attempt WHERE task_id = @task_id FOR UPDATE;
 -- name: GetWorkflowAttemptByTask :one
 SELECT * FROM workflow_attempt WHERE task_id = @task_id;
 
+-- name: CreateWorkflowContextSnapshot :one
+INSERT INTO workflow_context_snapshot (
+    id, workspace_id, run_id, node_id, attempt_id, task_id,
+    run_revision, digest, manifest
+) VALUES (
+    @id, @workspace_id, @run_id, @node_id, @attempt_id, @task_id,
+    @run_revision, @digest, @manifest
+)
+RETURNING *;
+
+-- name: CreateWorkflowContextItem :one
+INSERT INTO workflow_context_item (
+    id, workspace_id, snapshot_id, ordinal, reference_key, kind, title,
+    content, search_text, source_type, source_id, source_digest
+) VALUES (
+    @id, @workspace_id, @snapshot_id, @ordinal, @reference_key, @kind, @title,
+    @content, @search_text, @source_type, sqlc.narg(source_id), @source_digest
+)
+RETURNING *;
+
+-- name: GetWorkflowContextSnapshotByTask :one
+SELECT * FROM workflow_context_snapshot
+WHERE task_id = @task_id AND workspace_id = @workspace_id;
+
+-- name: ListWorkflowContextItems :many
+SELECT * FROM workflow_context_item
+WHERE snapshot_id = @snapshot_id AND workspace_id = @workspace_id
+ORDER BY ordinal;
+
+-- name: GetWorkflowContextBootstrapItems :many
+SELECT * FROM workflow_context_item
+WHERE snapshot_id = @snapshot_id AND workspace_id = @workspace_id
+  AND reference_key IN ('task/current', 'workflow/overview')
+ORDER BY ordinal;
+
+-- name: SearchWorkflowContextItems :many
+SELECT * FROM workflow_context_item
+WHERE snapshot_id = @snapshot_id AND workspace_id = @workspace_id
+  AND (sqlc.arg('query')::text = '' OR search_text ILIKE '%' || sqlc.arg('query')::text || '%')
+  AND (cardinality(sqlc.arg('kinds')::text[]) = 0 OR kind = ANY(sqlc.arg('kinds')::text[]))
+ORDER BY
+  CASE WHEN lower(title) = lower(sqlc.arg('query')::text) THEN 0
+       WHEN lower(reference_key) = lower(sqlc.arg('query')::text) THEN 1
+       WHEN lower(title) LIKE '%' || lower(sqlc.arg('query')::text) || '%' THEN 2
+       ELSE 3 END,
+  ordinal
+LIMIT @result_limit;
+
+-- name: GetWorkflowContextItemByReference :one
+SELECT * FROM workflow_context_item
+WHERE snapshot_id = @snapshot_id AND workspace_id = @workspace_id
+  AND reference_key = @reference_key;
+
 -- name: GetWorkflowAttempt :one
 SELECT * FROM workflow_attempt
 WHERE id = @id AND run_id = @run_id AND workspace_id = @workspace_id;
@@ -215,6 +268,11 @@ SELECT * FROM workflow_verification
 WHERE run_id = @run_id AND workspace_id = @workspace_id
 ORDER BY created_at, verification_no;
 
+-- name: ListWorkflowArtifacts :many
+SELECT * FROM workflow_artifact
+WHERE run_id = @run_id AND workspace_id = @workspace_id
+ORDER BY created_at, id;
+
 -- name: AppendWorkflowEvent :one
 INSERT INTO workflow_event (
     id, workspace_id, run_id, sequence, aggregate_type, aggregate_id,
@@ -275,7 +333,9 @@ SET status = CASE WHEN attempts >= @max_attempts THEN 'dead' ELSE 'pending' END,
 WHERE id = @id AND lease_token = @lease_token AND status = 'leased';
 
 -- name: DeleteWorkspaceWorkflowRuntime :exec
-WITH deleted_outbox AS (DELETE FROM workflow_outbox WHERE workspace_id = @workspace_id),
+WITH deleted_context_items AS (DELETE FROM workflow_context_item WHERE workspace_id = @workspace_id),
+deleted_context_snapshots AS (DELETE FROM workflow_context_snapshot WHERE workspace_id = @workspace_id),
+deleted_outbox AS (DELETE FROM workflow_outbox WHERE workspace_id = @workspace_id),
 deleted_events AS (DELETE FROM workflow_event WHERE workspace_id = @workspace_id),
 deleted_verifications AS (DELETE FROM workflow_verification WHERE workspace_id = @workspace_id),
 deleted_artifacts AS (DELETE FROM workflow_artifact WHERE workspace_id = @workspace_id),

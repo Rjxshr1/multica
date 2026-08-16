@@ -7,6 +7,21 @@ import (
 	"fmt"
 )
 
+var workflowContextMCPOverlay = json.RawMessage(`{"mcpServers":{"multica-context":{"command":"multica","args":["context","mcp"]}}}`)
+
+// workflowContextMCPSupported mirrors the runtime providers that consume the
+// canonical mcpServers envelope. Keep this server-side gate fail-closed: a
+// Workflow task on a backend without MCP support still runs with its compact
+// default brief rather than receiving configuration it cannot interpret.
+func workflowContextMCPSupported(provider string) bool {
+	switch provider {
+	case "claude", "codebuddy", "codex", "cursor", "grok", "hermes", "kimi", "reasonix", "dsh", "kiro", "opencode", "openclaw", "qoder", "qoderclicn", "qwen", "qwenpaw", "traecli":
+		return true
+	default:
+		return false
+	}
+}
+
 // mergeMCPOverlay layers a per-task overlay on top of an agent's saved
 // mcp_config and returns the merged JSON for the daemon claim wire shape.
 //

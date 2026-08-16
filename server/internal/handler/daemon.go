@@ -1857,6 +1857,7 @@ func (h *Handler) failClaimedTaskBeforeLaunch(
 func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQueue, runtime db.AgentRuntime, runtimeID, runtimeWorkspaceID string) (resp AgentTaskResponse, deliveredCommentIDs []pgtype.UUID, agentSkillCount, builtinSkillCount int, failure *claimBuildFailure) {
 	// Build response with fresh agent data (name + skills + custom_env + custom_args).
 	resp = taskToResponse(*task, runtimeWorkspaceID)
+	workflowOwned := h.WorkflowRuntime != nil && h.WorkflowRuntime.IsWorkflowTask(r.Context(), task.ID)
 	// Claim-only capability: this server resolves the squad-leader role on the
 	// wire (is_leader_task / squad_id), so the daemon must not re-derive it
 	// from the briefing text. Set unconditionally — on every claim, leader or
@@ -1988,6 +1989,16 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		if composioMCPEnabled && len(task.RuntimeMcpOverlay) > 0 {
 			if merged, err := mergeMCPOverlay(mcpConfig, json.RawMessage(task.RuntimeMcpOverlay)); err != nil {
 				slog.Warn("daemon claim: merge runtime_mcp_overlay failed; falling back to agent mcp_config", "task_id", uuidToString(task.ID), "error", err)
+			} else {
+				mcpConfig = merged
+			}
+		}
+		// Workflow Attempts receive a task-local, read-only Context Gateway.
+		// The stdio process inherits the short-lived mat_ task token minted for
+		// this claim, so no credential is stored in agent or workspace config.
+		if workflowContextMCPSupported(runtime.Provider) && workflowOwned {
+			if merged, err := mergeMCPOverlay(mcpConfig, workflowContextMCPOverlay); err != nil {
+				slog.Warn("daemon claim: merge workflow context MCP failed; continuing with compact context only", "task_id", uuidToString(task.ID), "error", err)
 			} else {
 				mcpConfig = merged
 			}
@@ -2995,6 +3006,23 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			outcome: "error_worktree_daemon_version",
 			status:  http.StatusUnprocessableEntity,
 			message: reason,
+		}
+	}
+
+	if workflowOwned {
+		// Workflow Attempts are intentionally fresh sessions. Carrying a prior
+		// issue/chat transcript would bypass the snapshot budget and recreate the
+		// unbounded-context problem the Gateway is meant to solve. Workdir reuse
+		// remains intact for code continuity; only provider conversation state is
+		// replaced by the immutable L0 bootstrap plus on-demand MCP reads.
+		resp.PriorSessionID = ""
+		resp.PriorSessionResumeUnavailable = false
+		bootstrap, err := h.WorkflowRuntime.ContextBootstrap(r.Context(), runtime.WorkspaceID, task.ID)
+		if err != nil {
+			slog.Error("daemon claim: workflow context bootstrap unavailable", "task_id", uuidToString(task.ID), "error", err)
+			resp.WorkflowContext = &service.WorkflowContextBootstrap{Task: json.RawMessage(`{}`), Workflow: json.RawMessage(`{}`)}
+		} else {
+			resp.WorkflowContext = bootstrap
 		}
 	}
 

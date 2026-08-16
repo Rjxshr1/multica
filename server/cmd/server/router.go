@@ -1132,6 +1132,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/api/cli-token", h.IssueCliToken)
 		r.Post("/api/upload-file", h.UploadFile)
 		r.Post("/api/feedback", h.CreateFeedback)
+		// Read-only, task-token-scoped Context Gateway used by the local
+		// `multica context mcp` process. These routes intentionally sit outside
+		// member-facing Workflow control APIs and cannot mutate runtime state.
+		r.Get("/api/workflow-context/catalog", h.GetWorkflowContextCatalog)
+		r.Post("/api/workflow-context/search", h.SearchWorkflowContext)
+		r.Post("/api/workflow-context/item", h.GetWorkflowContextItem)
 		r.With(handler.RequireHumanActor).Post("/api/client-usage", h.UpsertClientUsage)
 
 		// Note (MUL-4309): the generic OpenAI-compatible passthrough endpoints

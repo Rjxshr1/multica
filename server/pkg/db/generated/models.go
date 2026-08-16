@@ -1482,6 +1482,35 @@ type WorkflowAttempt struct {
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
+type WorkflowContextItem struct {
+	ID           pgtype.UUID        `json:"id"`
+	WorkspaceID  pgtype.UUID        `json:"workspace_id"`
+	SnapshotID   pgtype.UUID        `json:"snapshot_id"`
+	Ordinal      int32              `json:"ordinal"`
+	ReferenceKey string             `json:"reference_key"`
+	Kind         string             `json:"kind"`
+	Title        string             `json:"title"`
+	Content      []byte             `json:"content"`
+	SearchText   string             `json:"search_text"`
+	SourceType   string             `json:"source_type"`
+	SourceID     pgtype.UUID        `json:"source_id"`
+	SourceDigest string             `json:"source_digest"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+type WorkflowContextSnapshot struct {
+	ID          pgtype.UUID        `json:"id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	RunID       pgtype.UUID        `json:"run_id"`
+	NodeID      pgtype.UUID        `json:"node_id"`
+	AttemptID   pgtype.UUID        `json:"attempt_id"`
+	TaskID      pgtype.UUID        `json:"task_id"`
+	RunRevision int64              `json:"run_revision"`
+	Digest      string             `json:"digest"`
+	Manifest    []byte             `json:"manifest"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
 type WorkflowEvent struct {
 	ID                pgtype.UUID        `json:"id"`
 	WorkspaceID       pgtype.UUID        `json:"workspace_id"`

@@ -55,14 +55,16 @@ echo "[3/4] Real TaskService + DB loop + transactional outbox"
   DATABASE_URL="$database_url" go test ./internal/service \
     -run 'TestWorkflow(RuntimeDatabase(Loop|InsertNodeBefore)|RuntimeOrphanedTaskFailureReentersNode|TaskServiceCompletionEntersVerification)' \
     -count=1 -v
+  DATABASE_URL="$database_url" go test ./internal/handler \
+    -run 'TestWorkflowContext' -count=1 -v
 )
 
 echo "[4/4] Race, vet, API/router compilation"
 (
   cd "$project_root/server"
   go test -race ./internal/workflowruntime
-  go vet ./internal/workflowruntime ./internal/service ./internal/handler ./cmd/workflow_loop_demo ./cmd/server
-  go test ./internal/handler ./cmd/server
+  go vet ./internal/workflowruntime ./internal/service ./internal/handler ./internal/daemon ./cmd/workflow_loop_demo ./cmd/multica ./cmd/server
+  go test ./internal/handler ./internal/daemon ./cmd/multica ./cmd/server
 )
 
 echo

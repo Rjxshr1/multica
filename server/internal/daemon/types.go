@@ -76,6 +76,7 @@ type Task struct {
 	RuntimeID               string                              `json:"runtime_id"`
 	IssueID                 string                              `json:"issue_id"`
 	WorkspaceID             string                              `json:"workspace_id"`
+	WorkflowContext         *WorkflowContextBootstrapData       `json:"workflow_context,omitempty"`
 	PluginExecutionManifest *PluginExecutionManifestData        `json:"plugin_execution_manifest,omitempty"`
 	RemoteMCPConnections    []pluginruntime.RemoteMCPConnection `json:"remote_mcp_connections,omitempty"`
 	// RemoteMCPDaemonToken stays inside the daemon and authenticates the local
@@ -163,6 +164,14 @@ type Task struct {
 	// Empty or non-task-scoped values are fatal for writable agent tasks; the
 	// daemon must not fall back to its own token. See MUL-3292.
 	AuthToken string `json:"auth_token,omitempty"`
+}
+
+type WorkflowContextBootstrapData struct {
+	SnapshotID      string          `json:"snapshot_id"`
+	ContextRevision int64           `json:"context_revision"`
+	SourceDigest    string          `json:"source_digest"`
+	Task            json.RawMessage `json:"task"`
+	Workflow        json.RawMessage `json:"workflow"`
 }
 
 // PluginExecutionManifestData mirrors the immutable enqueue-time plugin pin

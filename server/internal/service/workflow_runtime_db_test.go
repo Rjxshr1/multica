@@ -277,6 +277,31 @@ func TestWorkflowTaskServiceCompletionEntersVerification(t *testing.T) {
 	if err := workflow.BindTask(ctx, workspaceID, lease, util.MustParseUUID(taskIDText)); err != nil {
 		t.Fatal(err)
 	}
+	catalogBefore, err := workflow.ContextCatalog(ctx, workspaceID, util.MustParseUUID(taskIDText))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if catalogBefore.ContextRevision <= 0 || catalogBefore.SourceDigest == "" || len(catalogBefore.Items) < 2 {
+		t.Fatalf("context catalog was not frozen at bind: %+v", catalogBefore)
+	}
+	results, err := workflow.SearchContext(ctx, workspaceID, util.MustParseUUID(taskIDText), WorkflowContextSearchInput{Query: "execute", Kinds: []string{"task"}, Limit: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].ReferenceKey != "task/current" {
+		t.Fatalf("task context search = %+v, want task/current", results)
+	}
+	frozenTask, err := workflow.GetContextItem(ctx, workspaceID, util.MustParseUUID(taskIDText), "task/current")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frozenTaskContent map[string]any
+	if err := json.Unmarshal(frozenTask.Content, &frozenTaskContent); err != nil {
+		t.Fatal(err)
+	}
+	if frozenTaskContent["status"] != "running" {
+		t.Fatalf("frozen task context missing bind-time state: %s", frozenTask.Content)
+	}
 
 	taskService := NewTaskService(queries, pool, nil, events.New())
 	taskService.WorkflowRuntime = workflow
@@ -303,6 +328,13 @@ func TestWorkflowTaskServiceCompletionEntersVerification(t *testing.T) {
 	}
 	if final.Run.Status != "succeeded" {
 		t.Fatalf("run status = %s, want succeeded", final.Run.Status)
+	}
+	catalogAfter, err := workflow.ContextCatalog(ctx, workspaceID, util.MustParseUUID(taskIDText))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if catalogAfter.SourceDigest != catalogBefore.SourceDigest || catalogAfter.ContextRevision != catalogBefore.ContextRevision || len(catalogAfter.Items) != len(catalogBefore.Items) {
+		t.Fatalf("attempt context mutated after completion: before=%+v after=%+v", catalogBefore, catalogAfter)
 	}
 }
 

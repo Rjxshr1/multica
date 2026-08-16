@@ -314,6 +314,7 @@ type AgentTaskResponse struct {
 	RuntimeID               string                               `json:"runtime_id"`
 	IssueID                 string                               `json:"issue_id"`
 	WorkspaceID             string                               `json:"workspace_id"`
+	WorkflowContext         *service.WorkflowContextBootstrap    `json:"workflow_context,omitempty"`
 	PluginExecutionManifest *service.PluginExecutionManifestData `json:"plugin_execution_manifest,omitempty"`
 	RemoteMCPConnections    []pluginruntime.RemoteMCPConnection  `json:"remote_mcp_connections,omitempty"`
 	// RemoteMCPDaemonToken is a short-lived, workspace-and-daemon scoped

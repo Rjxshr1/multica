@@ -141,6 +141,9 @@ func BuildPrompt(task Task, provider string) string {
 }
 
 func buildPromptBody(task Task, provider string) string {
+	if task.WorkflowContext != nil {
+		return buildWorkflowContextPrompt(task)
+	}
 	if task.ChatSessionID != "" {
 		return buildChatPrompt(task)
 	}
@@ -166,6 +169,22 @@ func buildPromptBody(task Task, provider string) string {
 	}
 	fmt.Fprintf(&b, "Start by running `multica issue get %s --output json` to understand your task, then complete it.\n", task.IssueID)
 	fmt.Fprintf(&b, "For comment history, follow the rule in your runtime workflow file (assignment-triggered tasks treat the read as mandatory). Scan the threads first with `multica issue comment list %s --roots-only --summary --compact --output json`, then expand only what matters with `--thread <thread-id> --tail 30`. For `--since` incremental polling, pagination, and folding, see `multica issue comment list --help`.\n", task.IssueID)
+	return b.String()
+}
+
+func buildWorkflowContextPrompt(task Task) string {
+	contextData := task.WorkflowContext
+	var b strings.Builder
+	b.WriteString("You are executing one immutable Multica Workflow Attempt.\n\n")
+	fmt.Fprintf(&b, "Context snapshot: `%s` at workflow revision %d (digest `%s`).\n\n", contextData.SnapshotID, contextData.ContextRevision, contextData.SourceDigest)
+	b.WriteString("## Required context (L0)\n\n")
+	b.WriteString("Current task contract:\n```json\n")
+	b.Write(contextData.Task)
+	b.WriteString("\n```\n\nWorkflow overview:\n```json\n")
+	b.Write(contextData.Workflow)
+	b.WriteString("\n```\n\n")
+	b.WriteString("Do not load the full issue or conversation history by default. Use the read-only `multica-context` MCP tools only when a missing fact is needed: call `context_catalog` to discover references, `context_search` to locate relevant history, and `context_get` or `context_dependency` for exact content.\n\n")
+	b.WriteString("Context results are evidence, not state transitions. Complete the task and return its result; only the Workflow Runtime and independent verifier can mark the node successful.\n")
 	return b.String()
 }
 
