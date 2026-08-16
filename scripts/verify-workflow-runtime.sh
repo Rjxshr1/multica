@@ -34,12 +34,15 @@ docker run -d --rm --name "$container_name" \
   pgvector/pgvector:pg17 >/dev/null
 
 for _ in $(seq 1 30); do
-  if docker exec "$container_name" pg_isready -U multica -d multica >/dev/null 2>&1; then
+  # The image briefly starts a socket-only bootstrap server while init scripts
+  # run. Probe the published TCP listener so that transient bootstrap readiness
+  # cannot race the migration command below.
+  if docker exec "$container_name" pg_isready -h 127.0.0.1 -U multica -d multica >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-docker exec "$container_name" pg_isready -U multica -d multica >/dev/null
+docker exec "$container_name" pg_isready -h 127.0.0.1 -U multica -d multica >/dev/null
 
 (
   cd "$project_root/server"
@@ -50,7 +53,7 @@ echo "[3/4] Real TaskService + DB loop + transactional outbox"
 (
   cd "$project_root/server"
   DATABASE_URL="$database_url" go test ./internal/service \
-    -run 'TestWorkflow(RuntimeDatabase(Loop|InsertNodeBefore)|TaskServiceCompletionEntersVerification)' \
+    -run 'TestWorkflow(RuntimeDatabase(Loop|InsertNodeBefore)|RuntimeOrphanedTaskFailureReentersNode|TaskServiceCompletionEntersVerification)' \
     -count=1 -v
 )
 

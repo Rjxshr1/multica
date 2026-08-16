@@ -4784,20 +4784,38 @@ func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTas
 	retried := 0
 
 	for _, t := range tasks {
-		// Auto-retry first so the issue stays in_progress rather than
-		// flapping todo → in_progress within a tick.
-		retryPending := false
-		if child, _ := s.MaybeRetryFailedTask(ctx, t); child != nil {
-			retryPending = true
-			retried++
-			if t.IssueID.Valid {
-				retriedIssues[util.UUIDToString(t.IssueID)] = true
-			}
-		}
-
 		failureReason := "agent_error"
 		if t.FailureReason.Valid && t.FailureReason.String != "" {
 			failureReason = t.FailureReason.String
+		}
+
+		// Sweepers fail task rows directly in SQL, outside FailTask's atomic
+		// Workflow settlement. Reconcile the bound attempt before considering
+		// the legacy retry path so Workflow retry policy remains the sole owner.
+		workflowOwned := false
+		if s.WorkflowRuntime != nil {
+			owned, settleErr := s.WorkflowRuntime.SettleTaskFailure(ctx, t.ID, failureReason, t.Error.String)
+			workflowOwned = owned
+			if settleErr != nil {
+				slog.Error("handle failed tasks: settle workflow attempt failed",
+					"task_id", util.UUIDToString(t.ID),
+					"failure_reason", failureReason,
+					"error", settleErr,
+				)
+			}
+		}
+
+		// Auto-retry first so the issue stays in_progress rather than
+		// flapping todo → in_progress within a tick.
+		retryPending := false
+		if !workflowOwned {
+			if child, _ := s.MaybeRetryFailedTask(ctx, t); child != nil {
+				retryPending = true
+				retried++
+				if t.IssueID.Valid {
+					retriedIssues[util.UUIDToString(t.IssueID)] = true
+				}
+			}
 		}
 		s.captureTaskFailed(ctx, t)
 

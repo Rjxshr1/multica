@@ -500,6 +500,15 @@ func (s *WorkflowRuntimeService) SettleTaskFailureTx(ctx context.Context, qtx *d
 	if err != nil {
 		return true, err
 	}
+	// Failure reconciliation is deliberately idempotent. The normal daemon
+	// failure path settles the attempt in the same transaction as the task,
+	// while timeout/runtime sweepers may later surface the same failed row via
+	// HandleFailedTasks. Once an attempt is terminal there is nothing left to
+	// settle, but the task is still Workflow-owned and must never enter the
+	// legacy task retry path.
+	if attempt.Status != "queued" && attempt.Status != "dispatched" && attempt.Status != "running" {
+		return true, nil
+	}
 	node, err := qtx.GetWorkflowNodeForUpdate(ctx, db.GetWorkflowNodeForUpdateParams{ID: attempt.NodeID, RunID: attempt.RunID, WorkspaceID: attempt.WorkspaceID})
 	if err != nil {
 		return true, err
@@ -529,6 +538,20 @@ func (s *WorkflowRuntimeService) SettleTaskFailureTx(ctx context.Context, qtx *d
 		err = s.appendEvent(ctx, qtx, eventInput{WorkspaceID: attempt.WorkspaceID, RunID: attempt.RunID, AggregateType: "run", AggregateID: attempt.RunID, EventType: "workflow.failed", FromState: "running", ToState: "failed", AggregateRevision: run.Revision, Actor: WorkflowActor{Type: "system"}, IdempotencyKey: "workflow-fail:" + util.UUIDToString(taskID), Payload: map[string]any{"failure_code": failureCode}})
 	}
 	return true, err
+}
+
+// SettleTaskFailure reconciles a task that was already marked failed outside
+// TaskService.FailTask's transaction (for example by a timeout or offline
+// runtime sweeper). Workflow-owned tasks re-enter the node-level retry policy;
+// unbound tasks are left for the legacy task retry path.
+func (s *WorkflowRuntimeService) SettleTaskFailure(ctx context.Context, taskID pgtype.UUID, failureCode, detail string) (bool, error) {
+	var owned bool
+	err := s.inTx(ctx, func(qtx *db.Queries) error {
+		var err error
+		owned, err = s.SettleTaskFailureTx(ctx, qtx, taskID, failureCode, detail)
+		return err
+	})
+	return owned, err
 }
 
 func (s *WorkflowRuntimeService) Verify(ctx context.Context, input VerificationInput) (*WorkflowSnapshot, error) {
