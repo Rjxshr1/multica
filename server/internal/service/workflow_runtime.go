@@ -82,6 +82,15 @@ type VerificationInput struct {
 	IdempotencyKey string
 }
 
+type InsertWorkflowNodeBeforeInput struct {
+	WorkspaceID    pgtype.UUID
+	RunID          pgtype.UUID
+	TargetNodeKey  string
+	Node           WorkflowNodeSpec
+	IdempotencyKey string
+	Actor          WorkflowActor
+}
+
 type WorkflowRuntimeService struct {
 	Queries   *db.Queries
 	TxStarter TxStarter
@@ -217,6 +226,138 @@ func (s *WorkflowRuntimeService) Snapshot(ctx context.Context, workspaceID, runI
 		return nil, err
 	}
 	return &WorkflowSnapshot{Run: run, Nodes: nodes, Dependencies: deps, Attempts: attempts, Verifications: verifications, Events: events}, nil
+}
+
+// InsertNodeBefore atomically amends a running plan. The new gate inherits the
+// target's predecessors, and the target is rewired to depend only on the gate.
+func (s *WorkflowRuntimeService) InsertNodeBefore(ctx context.Context, input InsertWorkflowNodeBeforeInput) (*WorkflowSnapshot, error) {
+	if strings.TrimSpace(input.IdempotencyKey) == "" {
+		return nil, fmt.Errorf("idempotency_key is required")
+	}
+	if strings.TrimSpace(input.TargetNodeKey) == "" || strings.TrimSpace(input.Node.Key) == "" {
+		return nil, fmt.Errorf("target_node_key and node.key are required")
+	}
+	if input.TargetNodeKey == input.Node.Key {
+		return nil, fmt.Errorf("inserted node cannot target itself")
+	}
+	if len(input.Node.DependsOn) != 0 {
+		return nil, fmt.Errorf("inserted node dependencies are derived from target")
+	}
+	err := s.inTx(ctx, func(qtx *db.Queries) error {
+		if err := qtx.LockWorkflowRun(ctx, util.UUIDToString(input.RunID)); err != nil {
+			return err
+		}
+		if _, err := qtx.GetWorkflowEventByIdempotencyKey(ctx, db.GetWorkflowEventByIdempotencyKeyParams{RunID: input.RunID, WorkspaceID: input.WorkspaceID, IdempotencyKey: textValue(input.IdempotencyKey)}); err == nil {
+			return nil
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		run, err := qtx.GetWorkflowRun(ctx, db.GetWorkflowRunParams{ID: input.RunID, WorkspaceID: input.WorkspaceID})
+		if err != nil {
+			return err
+		}
+		if run.Status != "running" {
+			return fmt.Errorf("%w: workflow is %s", ErrWorkflowInvalidState, run.Status)
+		}
+		target, err := qtx.GetWorkflowNodeByKeyForUpdate(ctx, db.GetWorkflowNodeByKeyForUpdateParams{NodeKey: input.TargetNodeKey, RunID: input.RunID, WorkspaceID: input.WorkspaceID})
+		if err != nil {
+			return err
+		}
+		if target.Status != "ready" && target.Status != "waiting" {
+			return fmt.Errorf("%w: target node %s is %s", ErrWorkflowInvalidState, input.TargetNodeKey, target.Status)
+		}
+		if _, err := qtx.GetWorkflowNodeByKeyForUpdate(ctx, db.GetWorkflowNodeByKeyForUpdateParams{NodeKey: input.Node.Key, RunID: input.RunID, WorkspaceID: input.WorkspaceID}); err == nil {
+			return fmt.Errorf("node key %q already exists", input.Node.Key)
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+
+		dependencies, err := qtx.ListWorkflowDependencies(ctx, db.ListWorkflowDependenciesParams{RunID: input.RunID, WorkspaceID: input.WorkspaceID})
+		if err != nil {
+			return err
+		}
+		predecessors := make([]pgtype.UUID, 0)
+		for _, dependency := range dependencies {
+			if sameUUID(dependency.SuccessorNodeID, target.ID) {
+				predecessors = append(predecessors, dependency.PredecessorNodeID)
+			}
+		}
+		status := "ready"
+		if len(predecessors) > 0 {
+			status = "waiting"
+			nodes, listErr := qtx.ListWorkflowNodes(ctx, db.ListWorkflowNodesParams{RunID: input.RunID, WorkspaceID: input.WorkspaceID})
+			if listErr != nil {
+				return listErr
+			}
+			states := make(map[[16]byte]string, len(nodes))
+			for _, node := range nodes {
+				states[node.ID.Bytes] = node.Status
+			}
+			allSucceeded := true
+			for _, predecessor := range predecessors {
+				allSucceeded = allSucceeded && states[predecessor.Bytes] == "succeeded"
+			}
+			if allSucceeded {
+				status = "ready"
+			}
+		}
+		nodeID := newPGUUID()
+		executorJSON, _ := marshalObject(input.Node.ExecutorSpec)
+		retryJSON, _ := marshalObject(withDefaultRetryPolicy(input.Node.RetryPolicy))
+		verificationJSON, _ := marshalObject(input.Node.VerificationPolicy)
+		inputJSON, _ := marshalObject(input.Node.Input)
+		inserted, err := qtx.CreateWorkflowNode(ctx, db.CreateWorkflowNodeParams{ID: nodeID, WorkspaceID: input.WorkspaceID, RunID: input.RunID, NodeKey: input.Node.Key, NodeKind: defaultNodeKind(input.Node.Kind), Status: status, ExecutorSpec: executorJSON, RetryPolicy: retryJSON, VerificationPolicy: verificationJSON, InputSpec: inputJSON, InputDigest: digestBytes(inputJSON)})
+		if err != nil {
+			return err
+		}
+		if err := qtx.DeleteWorkflowDependenciesForSuccessor(ctx, db.DeleteWorkflowDependenciesForSuccessorParams{RunID: input.RunID, WorkspaceID: input.WorkspaceID, SuccessorNodeID: target.ID}); err != nil {
+			return err
+		}
+		for _, predecessor := range predecessors {
+			if _, err := qtx.CreateWorkflowDependency(ctx, db.CreateWorkflowDependencyParams{ID: newPGUUID(), WorkspaceID: input.WorkspaceID, RunID: input.RunID, PredecessorNodeID: predecessor, SuccessorNodeID: nodeID}); err != nil {
+				return err
+			}
+		}
+		if _, err := qtx.CreateWorkflowDependency(ctx, db.CreateWorkflowDependencyParams{ID: newPGUUID(), WorkspaceID: input.WorkspaceID, RunID: input.RunID, PredecessorNodeID: nodeID, SuccessorNodeID: target.ID}); err != nil {
+			return err
+		}
+		updatedTarget, err := qtx.ResetWorkflowNodeForPlanAmendment(ctx, db.ResetWorkflowNodeForPlanAmendmentParams{ID: target.ID, RunID: input.RunID, WorkspaceID: input.WorkspaceID})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrWorkflowStaleRevision
+		}
+		if err != nil {
+			return err
+		}
+		var plan WorkflowPlan
+		if err := json.Unmarshal(run.PlanSnapshot, &plan); err != nil {
+			return fmt.Errorf("decode workflow plan snapshot: %w", err)
+		}
+		foundTarget := false
+		for index := range plan.Nodes {
+			if plan.Nodes[index].Key == input.TargetNodeKey {
+				foundTarget = true
+				input.Node.DependsOn = append([]string(nil), plan.Nodes[index].DependsOn...)
+				plan.Nodes[index].DependsOn = []string{input.Node.Key}
+				break
+			}
+		}
+		if !foundTarget {
+			return fmt.Errorf("workflow plan snapshot is missing target node %q", input.TargetNodeKey)
+		}
+		plan.Nodes = append(plan.Nodes, input.Node)
+		planJSON, err := json.Marshal(plan)
+		if err != nil {
+			return err
+		}
+		if _, err := qtx.UpdateWorkflowRunPlanSnapshot(ctx, db.UpdateWorkflowRunPlanSnapshotParams{PlanSnapshot: planJSON, DefinitionDigest: digestBytes(planJSON), ID: input.RunID, WorkspaceID: input.WorkspaceID}); err != nil {
+			return err
+		}
+		return s.appendEvent(ctx, qtx, eventInput{WorkspaceID: input.WorkspaceID, RunID: input.RunID, AggregateType: "node", AggregateID: inserted.ID, EventType: "node.inserted", FromState: "", ToState: status, AggregateRevision: inserted.Revision, Actor: input.Actor, IdempotencyKey: input.IdempotencyKey, Payload: map[string]any{"node_key": input.Node.Key, "before_node_key": input.TargetNodeKey, "target_revision": updatedTarget.Revision}})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s.Snapshot(ctx, input.WorkspaceID, input.RunID)
 }
 
 func (s *WorkflowRuntimeService) ClaimNode(ctx context.Context, workspaceID, runID pgtype.UUID, nodeKey, idempotencyKey string, actor WorkflowActor) (WorkflowLease, error) {

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"testing"
@@ -121,6 +122,99 @@ func TestWorkflowRuntimeDatabaseLoop(t *testing.T) {
 	}
 	if unpublished != len(final.Events) {
 		t.Fatalf("published outbox rows = %d, want %d", unpublished, len(final.Events))
+	}
+}
+
+func TestWorkflowRuntimeDatabaseInsertNodeBefore(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL is required for the workflow database test")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var tablesReady bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('workflow_run') IS NOT NULL`).Scan(&tablesReady); err != nil || !tablesReady {
+		t.Skip("workflow migrations are not applied")
+	}
+
+	queries := db.New(pool)
+	runtime := NewWorkflowRuntimeService(queries, pool)
+	workspaceID := newPGUUID()
+	created, err := runtime.CreateRun(ctx, CreateWorkflowRunInput{
+		WorkspaceID: workspaceID, IdempotencyKey: "db-amend-create",
+		Plan: WorkflowPlan{DefinitionKey: "amendment", DefinitionVersion: "1", Nodes: []WorkflowNodeSpec{
+			{Key: "prepare"},
+			{Key: "integration", DependsOn: []string{"prepare"}, RetryPolicy: map[string]any{"max_attempts": 2}},
+		}}, Actor: WorkflowActor{Type: "system"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = queries.DeleteWorkspaceWorkflowRuntime(context.Background(), workspaceID) })
+	input := InsertWorkflowNodeBeforeInput{WorkspaceID: workspaceID, RunID: created.Run.ID, TargetNodeKey: "integration", Node: WorkflowNodeSpec{Key: "review"}, IdempotencyKey: "insert-review", Actor: WorkflowActor{Type: "system"}}
+	amended, err := runtime.InsertNodeBefore(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.InsertNodeBefore(ctx, input); err != nil {
+		t.Fatalf("idempotent amendment: %v", err)
+	}
+	if len(amended.Nodes) != 3 || len(amended.Dependencies) != 2 {
+		t.Fatalf("nodes/dependencies = %d/%d, want 3/2", len(amended.Nodes), len(amended.Dependencies))
+	}
+	status := map[string]string{}
+	for _, node := range amended.Nodes {
+		status[node.NodeKey] = node.Status
+	}
+	if status["prepare"] != "ready" || status["review"] != "waiting" || status["integration"] != "waiting" {
+		t.Fatalf("amended states = %#v", status)
+	}
+	var plan WorkflowPlan
+	if err := json.Unmarshal(amended.Run.PlanSnapshot, &plan); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) != 3 {
+		t.Fatalf("plan node count = %d, want 3", len(plan.Nodes))
+	}
+
+	complete := func(nodeKey, command string) {
+		t.Helper()
+		lease, claimErr := runtime.ClaimNode(ctx, workspaceID, created.Run.ID, nodeKey, "claim-"+command, WorkflowActor{Type: "system"})
+		if claimErr != nil {
+			t.Fatal(claimErr)
+		}
+		taskID := newPGUUID()
+		bindSyntheticAttempt(t, ctx, queries, workspaceID, lease, taskID)
+		settleSuccess(t, ctx, pool, runtime, taskID, `{"ok":true}`)
+		if _, verifyErr := runtime.Verify(ctx, VerificationInput{WorkspaceID: workspaceID, RunID: created.Run.ID, AttemptID: lease.AttemptID, FenceToken: lease.FenceToken, Passed: true, VerifierKind: "system", IdempotencyKey: "verify-" + command}); verifyErr != nil {
+			t.Fatal(verifyErr)
+		}
+	}
+	complete("prepare", "prepare")
+	afterPrepare, err := runtime.Snapshot(ctx, workspaceID, created.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range afterPrepare.Nodes {
+		if node.NodeKey == "review" && node.Status != "ready" {
+			t.Fatalf("review status = %s, want ready", node.Status)
+		}
+		if node.NodeKey == "integration" && node.Status != "waiting" {
+			t.Fatalf("integration status = %s, want waiting", node.Status)
+		}
+	}
+	complete("review", "review")
+	complete("integration", "integration")
+	final, err := runtime.Snapshot(ctx, workspaceID, created.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Run.Status != "succeeded" {
+		t.Fatalf("run status = %s, want succeeded", final.Run.Status)
 	}
 }
 

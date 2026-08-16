@@ -507,6 +507,23 @@ func (q *Queries) CreateWorkflowVerification(ctx context.Context, arg CreateWork
 	return i, err
 }
 
+const deleteWorkflowDependenciesForSuccessor = `-- name: DeleteWorkflowDependenciesForSuccessor :exec
+DELETE FROM workflow_node_dependency
+WHERE run_id = $1 AND workspace_id = $2
+  AND successor_node_id = $3
+`
+
+type DeleteWorkflowDependenciesForSuccessorParams struct {
+	RunID           pgtype.UUID `json:"run_id"`
+	WorkspaceID     pgtype.UUID `json:"workspace_id"`
+	SuccessorNodeID pgtype.UUID `json:"successor_node_id"`
+}
+
+func (q *Queries) DeleteWorkflowDependenciesForSuccessor(ctx context.Context, arg DeleteWorkflowDependenciesForSuccessorParams) error {
+	_, err := q.db.Exec(ctx, deleteWorkflowDependenciesForSuccessor, arg.RunID, arg.WorkspaceID, arg.SuccessorNodeID)
+	return err
+}
+
 const deleteWorkspaceWorkflowRuntime = `-- name: DeleteWorkspaceWorkflowRuntime :exec
 WITH deleted_outbox AS (DELETE FROM workflow_outbox WHERE workspace_id = $1),
 deleted_events AS (DELETE FROM workflow_event WHERE workspace_id = $1),
@@ -1412,6 +1429,54 @@ func (q *Queries) ReleaseReadyWorkflowNodes(ctx context.Context, arg ReleaseRead
 	return items, nil
 }
 
+const resetWorkflowNodeForPlanAmendment = `-- name: ResetWorkflowNodeForPlanAmendment :one
+UPDATE workflow_node_execution
+SET status = 'waiting', revision = revision + 1, active_attempt_id = NULL,
+    failure_code = NULL, failure_detail = NULL, completed_at = NULL,
+    ready_at = NULL, next_retry_at = NULL, updated_at = now()
+WHERE id = $1 AND run_id = $2 AND workspace_id = $3
+  AND status IN ('ready', 'waiting') AND active_attempt_id IS NULL
+RETURNING id, workspace_id, run_id, node_key, issue_id, node_kind, status, revision, fence_token, active_attempt_id, attempt_count, executor_spec, retry_policy, verification_policy, input_spec, input_digest, ready_at, started_at, completed_at, next_retry_at, failure_code, failure_detail, created_at, updated_at
+`
+
+type ResetWorkflowNodeForPlanAmendmentParams struct {
+	ID          pgtype.UUID `json:"id"`
+	RunID       pgtype.UUID `json:"run_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) ResetWorkflowNodeForPlanAmendment(ctx context.Context, arg ResetWorkflowNodeForPlanAmendmentParams) (WorkflowNodeExecution, error) {
+	row := q.db.QueryRow(ctx, resetWorkflowNodeForPlanAmendment, arg.ID, arg.RunID, arg.WorkspaceID)
+	var i WorkflowNodeExecution
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.RunID,
+		&i.NodeKey,
+		&i.IssueID,
+		&i.NodeKind,
+		&i.Status,
+		&i.Revision,
+		&i.FenceToken,
+		&i.ActiveAttemptID,
+		&i.AttemptCount,
+		&i.ExecutorSpec,
+		&i.RetryPolicy,
+		&i.VerificationPolicy,
+		&i.InputSpec,
+		&i.InputDigest,
+		&i.ReadyAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.NextRetryAt,
+		&i.FailureCode,
+		&i.FailureDetail,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const retryWorkflowOutbox = `-- name: RetryWorkflowOutbox :execrows
 UPDATE workflow_outbox
 SET status = CASE WHEN attempts >= $1 THEN 'dead' ELSE 'pending' END,
@@ -1656,6 +1721,51 @@ func (q *Queries) SubmitWorkflowAttemptResult(ctx context.Context, arg SubmitWor
 		&i.FailureDetail,
 		&i.DeadlineAt,
 		&i.NextRetryAt,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updateWorkflowRunPlanSnapshot = `-- name: UpdateWorkflowRunPlanSnapshot :one
+UPDATE workflow_run
+SET plan_snapshot = $1, definition_digest = $2,
+    updated_at = now()
+WHERE id = $3 AND workspace_id = $4 AND status = 'running'
+RETURNING id, workspace_id, root_issue_id, status, revision, definition_key, definition_version, definition_digest, plan_snapshot, policy_snapshot, idempotency_key, created_by_type, created_by_id, created_at, started_at, completed_at, updated_at
+`
+
+type UpdateWorkflowRunPlanSnapshotParams struct {
+	PlanSnapshot     []byte      `json:"plan_snapshot"`
+	DefinitionDigest string      `json:"definition_digest"`
+	ID               pgtype.UUID `json:"id"`
+	WorkspaceID      pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) UpdateWorkflowRunPlanSnapshot(ctx context.Context, arg UpdateWorkflowRunPlanSnapshotParams) (WorkflowRun, error) {
+	row := q.db.QueryRow(ctx, updateWorkflowRunPlanSnapshot,
+		arg.PlanSnapshot,
+		arg.DefinitionDigest,
+		arg.ID,
+		arg.WorkspaceID,
+	)
+	var i WorkflowRun
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.RootIssueID,
+		&i.Status,
+		&i.Revision,
+		&i.DefinitionKey,
+		&i.DefinitionVersion,
+		&i.DefinitionDigest,
+		&i.PlanSnapshot,
+		&i.PolicySnapshot,
+		&i.IdempotencyKey,
+		&i.CreatedByType,
+		&i.CreatedByID,
 		&i.CreatedAt,
 		&i.StartedAt,
 		&i.CompletedAt,

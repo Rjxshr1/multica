@@ -149,6 +149,47 @@ func (e *Engine) Verify(lease Lease, passed bool, failure FailureClass, commandI
 	return err
 }
 
+// AddNodeBefore safely amends a live workflow plan. The inserted node inherits
+// the target's dependencies and becomes the target's only dependency, so the
+// target cannot resume until the inserted gate succeeds.
+func (e *Engine) AddNodeBefore(runID, targetNodeID string, spec NodeSpec, commandID string) error {
+	if e.store.CommandApplied(runID, commandID) {
+		return nil
+	}
+	run, err := e.Snapshot(runID)
+	if err != nil {
+		return err
+	}
+	if _, exists := run.Nodes[spec.ID]; exists {
+		return fmt.Errorf("%w: node %q already exists", ErrAlreadyExists, spec.ID)
+	}
+	target, err := run.Node(targetNodeID)
+	if err != nil {
+		return err
+	}
+	if target.State != NodeBlocked && target.State != NodeReady && target.State != NodeWaiting {
+		return fmt.Errorf("%w: target node %s is %s", ErrInvalidState, targetNodeID, target.State)
+	}
+	if spec.ID == "" || spec.ID == targetNodeID {
+		return fmt.Errorf("inserted node id is invalid")
+	}
+	if spec.MaxAttempts < 0 {
+		return fmt.Errorf("node %q max_attempts cannot be negative", spec.ID)
+	}
+	if len(spec.DependsOn) != 0 {
+		return fmt.Errorf("inserted node dependencies are derived from target")
+	}
+	derived := spec
+	derived.DependsOn = append([]string(nil), target.Spec.DependsOn...)
+	_, err = e.store.Append(runID, run.Version, commandID, Event{
+		Type:         EventNodeInserted,
+		OccurredAt:   e.now(),
+		NodeSpec:     &derived,
+		BeforeNodeID: targetNodeID,
+	})
+	return err
+}
+
 func (e *Engine) Events(runID string) []Event {
 	return e.store.Events(runID)
 }
@@ -251,6 +292,27 @@ func applyEvent(run *WorkflowRun, event Event) error {
 		attempt.FinishedAt = &finishedAt
 		node.ActiveAttemptID = ""
 		routeFailure(run, node, event.FailureClass)
+	case EventNodeInserted:
+		if event.NodeSpec == nil {
+			return fmt.Errorf("node.inserted event is missing node_spec")
+		}
+		if _, exists := run.Nodes[event.NodeSpec.ID]; exists {
+			return fmt.Errorf("node %q already exists", event.NodeSpec.ID)
+		}
+		target, err := run.Node(event.BeforeNodeID)
+		if err != nil {
+			return err
+		}
+		insertedSpec := *event.NodeSpec
+		if insertedSpec.MaxAttempts == 0 {
+			insertedSpec.MaxAttempts = 1
+		}
+		inserted := &NodeExecution{Spec: insertedSpec, State: NodeBlocked}
+		run.Nodes[insertedSpec.ID] = inserted
+		target.Spec.DependsOn = []string{insertedSpec.ID}
+		target.State = NodeBlocked
+		run.State = WorkflowRunning
+		releaseDependencies(run)
 	default:
 		return fmt.Errorf("unknown workflow event type %q", event.Type)
 	}

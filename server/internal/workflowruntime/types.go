@@ -107,6 +107,7 @@ const (
 	EventTaskResultAccepted   EventType = "task.result_accepted"
 	EventVerificationPassed   EventType = "verification.passed"
 	EventVerificationRejected EventType = "verification.rejected"
+	EventNodeInserted         EventType = "node.inserted"
 )
 
 type Event struct {
@@ -119,6 +120,8 @@ type Event struct {
 	Attempt      int           `json:"attempt,omitempty"`
 	Fence        uint64        `json:"fence,omitempty"`
 	FailureClass FailureClass  `json:"failure_class,omitempty"`
+	NodeSpec     *NodeSpec     `json:"node_spec,omitempty"`
+	BeforeNodeID string        `json:"before_node_id,omitempty"`
 }
 
 func (r *WorkflowRun) Node(id string) (*NodeExecution, error) {

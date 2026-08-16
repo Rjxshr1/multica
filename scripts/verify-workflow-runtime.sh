@@ -13,7 +13,13 @@ cleanup() {
 	  sleep 0.1
 	done
 }
-trap cleanup EXIT
+on_exit() {
+  local status=$?
+  trap - EXIT
+  cleanup
+  exit "$status"
+}
+trap on_exit EXIT
 
 echo "[1/4] Pure reducer: deterministic loop and fault-injected comparison"
 bash "$project_root/scripts/verify-workflow-loop.sh"
@@ -44,7 +50,7 @@ echo "[3/4] Real TaskService + DB loop + transactional outbox"
 (
   cd "$project_root/server"
   DATABASE_URL="$database_url" go test ./internal/service \
-    -run 'TestWorkflow(RuntimeDatabaseLoop|TaskServiceCompletionEntersVerification)' \
+    -run 'TestWorkflow(RuntimeDatabase(Loop|InsertNodeBefore)|TaskServiceCompletionEntersVerification)' \
     -count=1 -v
 )
 
@@ -58,5 +64,5 @@ echo "[4/4] Race, vet, API/router compilation"
 
 echo
 echo "ACCEPTANCE PASSED"
-echo "real loop: task complete -> verifying -> reject -> retry -> pass -> dependency release -> succeeded"
+echo "real loop: task complete -> verifying -> reject -> retry -> dynamic review insert -> pass -> dependency release -> succeeded"
 echo "database: all migrations + TaskService transaction hook + outbox delivery passed"

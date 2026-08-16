@@ -62,6 +62,89 @@ func TestVerificationFailureLoopsAndReleasesDependency(t *testing.T) {
 	}
 }
 
+func TestAddNodeBeforeWaitingTarget(t *testing.T) {
+	store := NewMemoryEventStore()
+	engine := NewEngine(store)
+	if err := engine.Create(WorkflowSpec{ID: "run", Nodes: []NodeSpec{
+		{ID: "build", MaxAttempts: 1},
+		{ID: "integration", DependsOn: []string{"build"}, MaxAttempts: 2},
+	}}, "create"); err != nil {
+		t.Fatal(err)
+	}
+
+	build, err := engine.Claim("run", "build", "claim-build")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.ReportTaskSucceeded(build, "done-build"); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Verify(build, true, "", "verify-build"); err != nil {
+		t.Fatal(err)
+	}
+	integration, err := engine.Claim("run", "integration", "claim-integration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.ReportTaskSucceeded(integration, "done-integration"); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Verify(integration, false, FailureDependencyGap, "reject-integration"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.AddNodeBefore("run", "integration", NodeSpec{ID: "review", MaxAttempts: 1}, "insert-review"); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.AddNodeBefore("run", "integration", NodeSpec{ID: "review", MaxAttempts: 1}, "insert-review"); err != nil {
+		t.Fatalf("idempotent insert: %v", err)
+	}
+	run, err := engine.Snapshot("run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Nodes["review"].State != NodeReady {
+		t.Fatalf("review state = %s, want ready", run.Nodes["review"].State)
+	}
+	if run.Nodes["integration"].State != NodeBlocked {
+		t.Fatalf("integration state = %s, want blocked", run.Nodes["integration"].State)
+	}
+	if got := run.Nodes["integration"].Spec.DependsOn; len(got) != 1 || got[0] != "review" {
+		t.Fatalf("integration dependencies = %v, want [review]", got)
+	}
+
+	review, err := engine.Claim("run", "review", "claim-review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.ReportTaskSucceeded(review, "done-review"); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Verify(review, true, "", "verify-review"); err != nil {
+		t.Fatal(err)
+	}
+	run, err = engine.Snapshot("run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Nodes["integration"].State != NodeReady {
+		t.Fatalf("integration state after review = %s, want ready", run.Nodes["integration"].State)
+	}
+}
+
+func TestAddNodeBeforeRejectsRunningTarget(t *testing.T) {
+	engine := NewEngine(NewMemoryEventStore())
+	if err := engine.Create(WorkflowSpec{ID: "run", Nodes: []NodeSpec{{ID: "target", MaxAttempts: 1}}}, "create"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Claim("run", "target", "claim"); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.AddNodeBefore("run", "target", NodeSpec{ID: "review"}, "insert"); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("error = %v, want ErrInvalidState", err)
+	}
+}
+
 func TestDuplicateCommandIsIdempotent(t *testing.T) {
 	store := NewMemoryEventStore()
 	engine := NewEngine(store)

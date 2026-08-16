@@ -26,6 +26,13 @@ SET revision = revision + 1, updated_at = now()
 WHERE id = @id AND workspace_id = @workspace_id
 RETURNING revision;
 
+-- name: UpdateWorkflowRunPlanSnapshot :one
+UPDATE workflow_run
+SET plan_snapshot = @plan_snapshot, definition_digest = @definition_digest,
+    updated_at = now()
+WHERE id = @id AND workspace_id = @workspace_id AND status = 'running'
+RETURNING *;
+
 -- name: SetWorkflowRunStatus :one
 UPDATE workflow_run
 SET status = @status,
@@ -52,6 +59,11 @@ INSERT INTO workflow_node_dependency (
     @id, @workspace_id, @run_id, @predecessor_node_id, @successor_node_id, 'required_success'
 )
 RETURNING *;
+
+-- name: DeleteWorkflowDependenciesForSuccessor :exec
+DELETE FROM workflow_node_dependency
+WHERE run_id = @run_id AND workspace_id = @workspace_id
+  AND successor_node_id = @successor_node_id;
 
 -- name: ListWorkflowNodes :many
 SELECT * FROM workflow_node_execution
@@ -81,6 +93,15 @@ SET status = 'running', revision = revision + 1,
     started_at = COALESCE(started_at, now()), updated_at = now()
 WHERE id = @id AND run_id = @run_id AND workspace_id = @workspace_id
   AND status = 'ready' AND revision = @expected_revision
+RETURNING *;
+
+-- name: ResetWorkflowNodeForPlanAmendment :one
+UPDATE workflow_node_execution
+SET status = 'waiting', revision = revision + 1, active_attempt_id = NULL,
+    failure_code = NULL, failure_detail = NULL, completed_at = NULL,
+    ready_at = NULL, next_retry_at = NULL, updated_at = now()
+WHERE id = @id AND run_id = @run_id AND workspace_id = @workspace_id
+  AND status IN ('ready', 'waiting') AND active_attempt_id IS NULL
 RETURNING *;
 
 -- name: CreateWorkflowAttempt :one

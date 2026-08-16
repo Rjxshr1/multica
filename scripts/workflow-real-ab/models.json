@@ -1,0 +1,25 @@
+{
+  "providers": {
+    "deepseek-anthropic": {
+      "baseUrl": "https://api.deepseek.com/anthropic",
+      "apiKey": "ANTHROPIC_API_KEY",
+      "api": "anthropic-messages",
+      "models": [
+        {
+          "id": "deepseek-v4-pro[1m]",
+          "name": "DeepSeek V4 Pro 1M",
+          "reasoning": true,
+          "contextWindow": 1000000,
+          "maxTokens": 8192,
+          "thinkingLevelMap": {
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high",
+            "xhigh": "max"
+          }
+        }
+      ]
+    }
+  }
+}

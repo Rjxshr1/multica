@@ -60,6 +60,38 @@ func (h *Handler) GetWorkflowRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, snapshot)
 }
 
+type insertWorkflowNodeBeforeRequest struct {
+	TargetNodeKey  string                   `json:"target_node_key"`
+	Node           service.WorkflowNodeSpec `json:"node"`
+	IdempotencyKey string                   `json:"idempotency_key"`
+}
+
+func (h *Handler) InsertWorkflowNodeBefore(w http.ResponseWriter, r *http.Request) {
+	workspaceID, runID, ok := workflowPathIDs(w, r)
+	if !ok {
+		return
+	}
+	member, exists := ctxMember(r.Context())
+	if !exists {
+		writeError(w, http.StatusUnauthorized, "workspace membership required")
+		return
+	}
+	var request insertWorkflowNodeBeforeRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&request); err != nil {
+		writeErrorCode(w, http.StatusBadRequest, "invalid_contract", "invalid workflow amendment")
+		return
+	}
+	if header := strings.TrimSpace(r.Header.Get("Idempotency-Key")); header != "" {
+		request.IdempotencyKey = header
+	}
+	snapshot, err := h.WorkflowRuntime.InsertNodeBefore(r.Context(), service.InsertWorkflowNodeBeforeInput{WorkspaceID: workspaceID, RunID: runID, TargetNodeKey: request.TargetNodeKey, Node: request.Node, IdempotencyKey: request.IdempotencyKey, Actor: service.WorkflowActor{Type: "member", ID: member.UserID}})
+	if err != nil {
+		writeWorkflowError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
+}
+
 type claimWorkflowNodeRequest struct {
 	NodeKey        string `json:"node_key"`
 	IdempotencyKey string `json:"idempotency_key"`

@@ -1166,6 +1166,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// these routes create, inspect, claim, bind, and independently verify runs.
 					r.Post("/workflows", h.CreateWorkflowRun)
 					r.Get("/workflows/{runId}", h.GetWorkflowRun)
+					r.Post("/workflows/{runId}/amendments/insert-before", h.InsertWorkflowNodeBefore)
 					r.Post("/workflows/{runId}/claim", h.ClaimWorkflowNode)
 					r.Post("/workflows/{runId}/attempts/{attemptId}/bind-task", h.BindWorkflowTask)
 					r.Post("/workflows/{runId}/attempts/{attemptId}/verify", h.VerifyWorkflowAttempt)
