@@ -149,7 +149,11 @@ Skill 专项 A/B（真实 HTTP、校验和缓存写入；服务端固定增加 1
 | 8 | 87.1ms | 23.4ms | 73.2% |
 | 16 | 175.9ms | 46.0ms | 73.8% |
 
-另外两组定位结果说明不应把所有慢都归因于 Skill 文件：Multica 环境准备从 0 个 Skill 的 0.37ms 增至 64 个 Skill 的 11.9ms；Pi 离线冷启动从无 Skill 的中位约 0.40s 增至显式加载 50 个真实 Skill 的约 0.44s。当前更大的固定成本是每次新起 Agent CLI 进程，Pi 本机约 0.4s；下一阶段可对支持 RPC/ACP 的 Runtime 做受控热进程池，但必须先解决工作目录、Session、MCP 凭证、取消和版本升级隔离，不能跨任务复用可变状态。
+另外两组定位结果说明不应把所有慢都归因于 Skill 文件：使用约 13KiB/Skill 的正文及 supporting files，真实 Prepare + 清理路径的中位耗时从 0 Skill 的 2.9ms 增至 8/32/64 Skill 的 13.9/48.2/92.7ms；Pi 离线冷启动从无 Skill 的中位约 0.40s 增至显式加载 50 个真实 Skill 的约 0.44s。当前更大的固定成本是每次新起 Agent CLI 进程，Pi 本机约 0.4s；下一阶段可对支持 RPC/ACP 的 Runtime 做受控热进程池，但必须先解决工作目录、Session、MCP 凭证、取消和版本升级隔离，不能跨任务复用可变状态。
+
+真实 Pi/DeepSeek 启动 A/B 又做了 5 轮交错配对（相同任务 Prompt、Runtime Brief 和 Skill 文件，20/20 次完成）。0 Skill 时，本地直跑首个有效输出/总耗时中位数为 `1.227s / 1.705s`，完整 Multica 冷启动为 `1.297s / 1.812s`；16 Skill 时分别为 `1.591s / 2.078s` 和 `1.569s / 2.138s`。Multica 在 Agent 进程启动前的缓存命中准备中位数只有 `1–2ms`；首包正负差异属于模型网络噪声，端到端总耗时中位数增加 `60–107ms`（`2.9%–6.3%`），不能解读为 Multica 让模型更快。
+
+上面的 A/B 用本机假服务隔离了代码路径，没有包含公网 RTT。对当前配置的 `https://api.multica.ai/health` 实测：新连接约 `583ms`，复用连接后 9 次中位约 `184ms`。因此真实远端链路的主要额外成本是控制面往返，而不是本地 Skill 扫描；WebSocket claim 和 HTTP keep-alive 已避免轮询与重复握手，后续应优先把终态 transcript tail 与 complete 合并提交、在离 Agent 更近的区域部署控制面，再考虑热进程池。
 
 “完整 Skill 正文按需取”暂不作为默认路径：名称索引已经存在，而本地扫描新增开销当前只有约 40ms；若把下载失败从准备期移动到 Agent 执行中，还会降低可诊断性和稳定性。更合适的演进是只对超大 Workspace Skill 启用 task-scoped、版本固定的 `skill_catalog / skill_get`，Builtin、Plugin 和脚本型 Skill 继续预取，并通过灰度比较首包耗时、任务成功率和 Skill 命中率后再扩大范围。
 
