@@ -24,9 +24,9 @@
 
 这说明 100% 不是模型第一次回答全部正确：`reuse` 有 52 个任务首次失败，全部通过结构化失败证据、分类重试和有界恢复自动闭环。Agent 评论只用于展示，不参与 Node 状态判定；唯一成功依据是 Runtime 状态机接受独立 Verifier 的 PASS。
 
-## 性能结果
+## 历史性能汇总（不进入正式指标）
 
-三组精确配对任务全部通过，因此性能比较没有幸存者偏差：
+旧评测只提交了逐组汇总，没有保留 360 个 Job 的逐条时延、Token、请求、重试与 Session 复用明细；执行顺序也是整组 Guard 与整组 Reuse 随机，而不是同任务两臂相邻。以下数字可用于定位下一轮测试，不能证明 Session 复用的正式性能收益：
 
 | 指标 | Guard | Reuse | 变化 |
 |---|---:|---:|---:|
@@ -34,7 +34,7 @@
 | Issue P50 | 32.0s | 25.8s | -19.4% |
 | Issue P95 | 107.1s | 116.9s | +9.2% |
 
-Token 和中位耗时连续受益，但 P95 在 G3 出现反向波动，因此当前不能宣称尾延迟已经稳定下降。简历主句继续采用更保守、已完成单组精确配对的“Token 降低 27%、Issue 中位耗时降低 13%”；扩大评测用于支撑成功率，不用聚合数字掩盖尾延迟波动。
+正式性能指标暂不发布。新一轮必须保留逐 Job 配对明细和运行指纹，Guard/Reuse 按同一任务相邻执行并随机先后顺序；缺对、重复、跨环境、跨版本、断点续跑混入、请求数不一致或 Session 复用序列异常时整轮拒绝。验收至少覆盖 300 对任务、5 个独立 Seed，使 P95 以上至少有 15 个观测点；所有配对任务完成状态一致后，才发布 Token、P50、P95 及配对 Bootstrap 95% 置信区间。
 
 ## 与原始架构对照
 
@@ -45,5 +45,6 @@ Token 和中位耗时连续受益，但 P95 在 G3 出现反向波动，因此�
 ## 复核入口
 
 - Harness：`scripts/workflow-runtime-eval/`
-- 紧凑逐组数据：`docs/workflow-runtime/evidence/reliability-ab-g1-g3.csv`
+- 历史逐组汇总（仅诊断）：`docs/workflow-runtime/evidence/reliability-ab-g1-g3.csv`
+- 干净配对分析器：`scripts/workflow-runtime-eval/analyze_paired.py`
 - Runtime 设计与边界：`docs/workflow-runtime/05-review-guide.md`

@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -113,16 +116,24 @@ func main() {
 	repetitions := flag.Int("repetitions", 1, "paired repetitions of every arm")
 	armsFlag := flag.String("arms", strings.Join(defaultArmIDs, ","), "comma-separated experiment arms")
 	driver := flag.String("driver", "real", "execution driver: real or deterministic")
+	schedule := flag.String("schedule", "paired", "execution schedule: paired (adjacent task arms) or grouped (throughput-oriented)")
 	injectFirstStallTasks := flag.String("inject-first-stall-tasks", "", "comma-separated tasks whose first request simulates a stalled worker")
 	faultStallSeconds := flag.Int("fault-stall-seconds", 12, "duration of each injected stalled worker")
 	limit := flag.Int("limit", 0, "run only first N selected tasks; zero means all")
 	selectedTasks := flag.String("tasks", "", "optional comma-separated task IDs")
+	environmentID := flag.String("environment-id", "", "stable environment/cohort identifier; required for real runs")
 	flag.Parse()
 	if *workers < 1 || *hardMinutes < 1 || *repetitions < 1 || *firstProgressSeconds < 1 || *idleSeconds < 1 || *faultStallSeconds < 1 {
 		fatalf("workers, repetitions, and timeout values must be positive")
 	}
 	if *driver != "real" && *driver != "deterministic" {
 		fatalf("driver must be real or deterministic")
+	}
+	if *schedule != "paired" && *schedule != "grouped" {
+		fatalf("schedule must be paired or grouped")
+	}
+	if *driver == "real" && strings.TrimSpace(*environmentID) == "" {
+		fatalf("--environment-id is required for real runs so cross-environment samples cannot be pooled silently")
 	}
 	profiles, err := parseArms(*armsFlag)
 	if err != nil {
@@ -167,15 +178,25 @@ func main() {
 	must(writeJSON(filepath.Join(runRoot, "selected_task_catalog.json"), tasks))
 	must(writeJSON(filepath.Join(runRoot, "arm_catalog.json"), profiles))
 	must(writeJSON(filepath.Join(runRoot, "run_metadata.json"), map[string]any{
-		"driver": *driver, "model": model, "seed": *seed, "workers_per_cell": *workers,
-		"repetitions": *repetitions, "hard_timeout_seconds": *hardMinutes * 60,
+		"schema_version": 2, "run_id": *runID, "created_at": time.Now().UTC().Format(time.RFC3339Nano),
+		"driver": *driver, "model": model, "seed": *seed, "workers_per_cell": *workers, "schedule": *schedule,
+		"environment_id": strings.TrimSpace(*environmentID), "git_revision": gitRevision(),
+		"selected_task_catalog_sha256": jsonSHA256(tasks), "arm_catalog_sha256": jsonSHA256(profiles),
+		"selected_task_catalog_file_sha256": fileSHA256(filepath.Join(runRoot, "selected_task_catalog.json")),
+		"arm_catalog_file_sha256":           fileSHA256(filepath.Join(runRoot, "arm_catalog.json")),
+		"repetitions":                       *repetitions, "hard_timeout_seconds": *hardMinutes * 60,
 		"first_progress_timeout_seconds": *firstProgressSeconds, "idle_timeout_seconds": *idleSeconds,
 		"metric_hierarchy":           []string{"request", "attempt", "node", "issue", "suite"},
 		"injected_first_stall_tasks": *injectFirstStallTasks, "fault_stall_seconds": *faultStallSeconds,
 	}))
-	cells := buildCells(profiles, *repetitions, tasks)
-	rng := rand.New(rand.NewSource(*seed))
-	rng.Shuffle(len(cells), func(i, j int) { cells[i], cells[j] = cells[j], cells[i] })
+	var cells []experimentCell
+	if *schedule == "paired" {
+		cells = buildPairedCells(profiles, *repetitions, tasks, *seed)
+	} else {
+		cells = buildCells(profiles, *repetitions, tasks)
+		rng := rand.New(rand.NewSource(*seed))
+		rng.Shuffle(len(cells), func(i, j int) { cells[i], cells[j] = cells[j], cells[i] })
+	}
 	for i := range cells {
 		cells[i].OrderIndex = i + 1
 	}
@@ -222,13 +243,19 @@ func main() {
 		wg.Wait()
 		cellFinished := time.Now()
 		cellResults := loadResults(filepath.Join(runRoot, "results", fmt.Sprintf("rep-%02d", cell.Repetition), cell.Arm.ID))
-		suite := summarizeSuite(cell.Arm.ID, cell.Repetition, cellStarted, cellFinished, cellResults)
-		suites = append(suites, suite)
-		must(writeJSON(filepath.Join(runRoot, "suites", fmt.Sprintf("rep-%02d-%s.json", cell.Repetition, cell.Arm.ID)), suite))
+		if *schedule == "grouped" {
+			suite := summarizeSuite(cell.Arm.ID, cell.Repetition, cellStarted, cellFinished, cellResults)
+			suites = append(suites, suite)
+			must(writeJSON(filepath.Join(runRoot, "suites", fmt.Sprintf("rep-%02d-%s.json", cell.Repetition, cell.Arm.ID)), suite))
+		}
 	}
 
 	results := loadResults(filepath.Join(runRoot, "results"))
+	if *schedule == "paired" {
+		suites = summarizeSerialEquivalentSuites(results)
+	}
 	must(writeJSON(filepath.Join(runRoot, "summary.json"), results))
+	must(writePerJobCSV(filepath.Join(runRoot, "per_job.csv"), results))
 	must(writeJSON(filepath.Join(runRoot, "suite_summary.json"), suites))
 	printSummary(runRoot, results)
 }
@@ -727,6 +754,67 @@ func writeJSON(path string, value any) error {
 		return err
 	}
 	return os.WriteFile(path, append(payload, '\n'), 0o644)
+}
+
+func jsonSHA256(value any) string {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		fatalf("hash JSON: %v", err)
+	}
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func fileSHA256(path string) string {
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		fatalf("hash file %s: %v", path, err)
+	}
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func gitRevision() string {
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	payload, err := cmd.Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(payload))
+}
+
+func writePerJobCSV(path string, results []result) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	handle, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer handle.Close()
+	w := csv.NewWriter(handle)
+	defer w.Flush()
+	if err := w.Write([]string{"pair_key", "seed", "repetition", "task_id", "arm", "category", "difficulty", "final_passed", "first_pass_success", "recovered", "duration_ms", "model_calls", "total_tokens", "cache_read_tokens", "guard_recoveries", "reused_requests", "request_count", "started_at", "finished_at", "termination_reasons"}); err != nil {
+		return err
+	}
+	for _, item := range results {
+		reused := 0
+		terminations := make([]string, 0, len(item.Requests))
+		for _, request := range item.Requests {
+			if request.SessionReused {
+				reused++
+			}
+			terminations = append(terminations, request.Termination)
+		}
+		row := []string{
+			fmt.Sprintf("%d/%d/%s", item.Seed, item.Repetition, item.TaskID), strconv.FormatInt(item.Seed, 10), strconv.Itoa(item.Repetition), item.TaskID, item.Arm, item.Category, item.Difficulty,
+			strconv.FormatBool(item.FinalPassed), strconv.FormatBool(item.FirstPassSuccess), strconv.FormatBool(item.Recovered), strconv.FormatInt(item.DurationMS, 10), strconv.Itoa(item.ModelCalls), strconv.FormatInt(item.Usage.Total, 10), strconv.FormatInt(item.Usage.CacheRead, 10), strconv.Itoa(item.GuardRecoveries), strconv.Itoa(reused), strconv.Itoa(len(item.Requests)), item.StartedAt, item.FinishedAt, strings.Join(terminations, ";"),
+		}
+		if err := w.Write(row); err != nil {
+			return err
+		}
+	}
+	return w.Error()
 }
 func must(err error) {
 	if err != nil {
