@@ -56,8 +56,9 @@ func allTasks() []taskSpec {
 			"Remove duplicated option construction, while preserving exports and fresh-object semantics (including nested headers). Run tests and explain the boundary in REFACTOR_NOTES.md.", "content-type"),
 
 		// Four technical-design tasks with independent rubric terms.
-		docTask("design-postgres-workflow", "technical_design", "hard", map[string]string{"SYSTEM.md": "Workers poll PostgreSQL. Duplicate delivery and crashes are expected. Need bounded retries and live progress; no broker may be added.\n"},
+		withRetryFeedback(docTask("design-postgres-workflow", "technical_design", "hard", map[string]string{"SYSTEM.md": "Workers poll PostgreSQL. Duplicate delivery and crashes are expected. Need bounded retries and live progress; no broker may be added.\n"},
 			"Write TECHNICAL_PLAN.md under 1200 words covering state machine, atomic claim, fencing, idempotency, crash recovery, retries, transactional outbox, observability, rollout and failure tests.", "TECHNICAL_PLAN.md", []string{"state", "fenc", "idempot", "outbox", "rollback", "crash"}),
+			"TECHNICAL_PLAN.md must contain the exact contiguous term `rollback`; `roll back` does not satisfy the document contract. Edit only TECHNICAL_PLAN.md and do not inspect model-logs."),
 		docTask("design-webhook-delivery", "technical_design", "medium", map[string]string{"SYSTEM.md": "A SaaS sends signed customer webhooks. Endpoints can be slow or unavailable. Customers need replay and delivery audit. PostgreSQL and an existing worker pool are available.\n"},
 			"Write TECHNICAL_PLAN.md for reliable webhook delivery. Cover durable events, per-endpoint ordering tradeoffs, signatures, idempotency, retry/backoff, dead letters, replay authorization, observability and rollout.", "TECHNICAL_PLAN.md", []string{"signature", "idempot", "retry", "dead", "replay", "observ"}),
 		docTask("design-zero-downtime-migration", "technical_design", "hard", map[string]string{"SYSTEM.md": "A 2TB orders table needs customer_tier populated from another table. Writes continue at 20k/s. A rollback path and correctness evidence are mandatory.\n"},
