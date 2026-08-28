@@ -65,9 +65,16 @@ def make_run(root, seed, corrupt_reuse=False):
         "schema_version": 2,
         "created_at": (base_time - timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
         "driver": "real",
+        "isolation": "macos-sandbox",
+        "provider": "fixture-provider",
         "model": "fixture-model",
+        "extensions": ["fixture-extension-a", "fixture-extension-b"],
         "seed": seed,
         "repetitions": 5,
+        "workers_per_cell": 1,
+        "hard_timeout_seconds": 300,
+        "first_progress_timeout_seconds": 180,
+        "idle_timeout_seconds": 420,
         "schedule": "paired",
         "environment_id": "fixture-environment",
         "git_revision": "0123456789abcdef",
@@ -125,6 +132,35 @@ class PairedAnalysisTest(unittest.TestCase):
             report = analyze([run], base / "out", min_pairs=300, min_seeds=5, bootstrap_iterations=20, bootstrap_seed=7)
             self.assertEqual("INSUFFICIENT_SAMPLE", report["status"])
             self.assertFalse((base / "out" / "formal_metrics.json").exists())
+
+    def test_cross_run_provider_or_extension_mismatch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = pathlib.Path(temp)
+            run_a = make_run(base / "run-a", 101)
+            run_b = make_run(base / "run-b", 202)
+            metadata = json.loads((run_b / "run_metadata.json").read_text())
+            metadata["provider"] = "other-provider"
+            metadata["extensions"] = ["fixture-extension-a", "other-extension"]
+            write_json(run_b / "run_metadata.json", metadata)
+            report = analyze([run_a, run_b], base / "out", min_pairs=1, min_seeds=1, bootstrap_iterations=20, bootstrap_seed=7)
+            self.assertEqual("REJECTED_DIRTY_DATA", report["status"])
+            errors = report["gates"]["integrity_errors"]
+            self.assertTrue(any("cross-run provider mismatch" in item for item in errors))
+            self.assertTrue(any("cross-run extensions mismatch" in item for item in errors))
+
+    def test_missing_execution_context_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = pathlib.Path(temp)
+            run = make_run(base / "run-a", 101)
+            metadata = json.loads((run / "run_metadata.json").read_text())
+            metadata.pop("provider")
+            metadata.pop("hard_timeout_seconds")
+            write_json(run / "run_metadata.json", metadata)
+            report = analyze([run], base / "out", min_pairs=1, min_seeds=1, bootstrap_iterations=20, bootstrap_seed=7)
+            self.assertEqual("REJECTED_DIRTY_DATA", report["status"])
+            errors = report["gates"]["integrity_errors"]
+            self.assertTrue(any("provider is empty or invalid" in item for item in errors))
+            self.assertTrue(any("hard_timeout_seconds must be a positive integer" in item for item in errors))
 
 
 if __name__ == "__main__":

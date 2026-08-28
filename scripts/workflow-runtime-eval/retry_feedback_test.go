@@ -12,8 +12,9 @@ import (
 // when the only evidence is a one-word exception such as "escape" or "base".
 func TestHardHiddenContractsProvideActionableRetryEvidence(t *testing.T) {
 	want := map[string][]string{
-		"integrate-csv-record": {"escaped", "double-quote", "literal quote"},
-		"fix-retry-backoff":    {"positive", "base"},
+		"integrate-csv-record":   {"escaped", "double-quote", "literal quote"},
+		"fix-retry-backoff":      {"positive", "base"},
+		"recover-email-contract": {"throw", "error", "non-empty", "exactly one"},
 	}
 
 	for _, task := range allTasks() {

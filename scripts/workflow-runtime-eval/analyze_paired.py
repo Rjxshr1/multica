@@ -94,6 +94,17 @@ def validate_run(run, expected_arms):
         errors.append(f"{run}: schema_version must be 2")
     if metadata.get("driver") != "real":
         errors.append(f"{run}: driver must be real, got {metadata.get('driver')!r}")
+    if metadata.get("isolation") not in ("bwrap", "macos-sandbox"):
+        errors.append(f"{run}: isolation must be bwrap or macos-sandbox, got {metadata.get('isolation')!r}")
+    if not isinstance(metadata.get("provider"), str) or not metadata["provider"].strip():
+        errors.append(f"{run}: provider is empty or invalid")
+    if not isinstance(metadata.get("model"), str) or not metadata["model"].strip():
+        errors.append(f"{run}: model is empty or invalid")
+    if not isinstance(metadata.get("extensions"), list) or any(not isinstance(item, str) or not item.strip() for item in metadata.get("extensions", [])):
+        errors.append(f"{run}: extensions must be a list of non-empty paths")
+    for field in ("workers_per_cell", "hard_timeout_seconds", "first_progress_timeout_seconds", "idle_timeout_seconds"):
+        if not isinstance(metadata.get(field), int) or metadata[field] <= 0:
+            errors.append(f"{run}: {field} must be a positive integer")
     if metadata.get("schedule") != "paired":
         errors.append(f"{run}: schedule must be paired, got {metadata.get('schedule')!r}")
     if not metadata.get("environment_id"):
@@ -222,11 +233,28 @@ def analyze(run_paths, output, min_pairs, min_seeds, bootstrap_iterations, boots
         if validated:
             runs.append(validated)
 
-    comparable_fields = ("driver", "model", "environment_id", "git_revision", "selected_task_catalog_sha256", "arm_catalog_sha256")
+    comparable_fields = (
+        "driver",
+        "isolation",
+        "provider",
+        "model",
+        "extensions",
+        "environment_id",
+        "git_revision",
+        "selected_task_catalog_sha256",
+        "arm_catalog_sha256",
+        "workers_per_cell",
+        "hard_timeout_seconds",
+        "first_progress_timeout_seconds",
+        "idle_timeout_seconds",
+    )
     for field in comparable_fields:
-        values = {run["metadata"].get(field) for run in runs}
+        values = {
+            json.dumps(run["metadata"].get(field), ensure_ascii=False, sort_keys=True)
+            for run in runs
+        }
         if len(values) > 1:
-            integrity_errors.append(f"cross-run {field} mismatch: {sorted(str(value) for value in values)}")
+            integrity_errors.append(f"cross-run {field} mismatch: {sorted(values)}")
 
     all_rows = [row for run in runs for row in run["rows"]]
     global_seen = Counter((row["_pair_key"], row["arm"]) for row in all_rows)

@@ -21,7 +21,7 @@ import (
 	workflowruntime "multica-expanded-eval/runtime"
 )
 
-const model = "deepseek-v4-pro[1m]"
+const defaultModel = "deepseek-v4-pro[1m]"
 
 type verifier struct {
 	Command       []string            `json:"command,omitempty"`
@@ -89,6 +89,9 @@ type evaluator struct {
 	runRoot              string
 	piPath               string
 	piConfig             string
+	provider             string
+	model                string
+	extensions           []string
 	seed                 int64
 	hardTimeout          time.Duration
 	firstProgressTimeout time.Duration
@@ -98,6 +101,7 @@ type evaluator struct {
 	requestMu            sync.Mutex
 	requestsByWorkspace  map[string][]requestMetric
 	driver               string
+	isolation            string
 	faultTasks           map[string]bool
 	faultStall           time.Duration
 	faultInjected        map[string]bool
@@ -108,6 +112,9 @@ func main() {
 	runID := flag.String("run-id", "", "stable run id (reuses completed task results)")
 	piPath := flag.String("pi", "/home/ai/codex-work/multica-workflow-eval/tooling/node_modules/.bin/pi", "Pi executable")
 	piConfig := flag.String("pi-config", "/home/ai/codex-work/multica-workflow-eval/pi-config", "Pi config")
+	provider := flag.String("provider", "deepseek-anthropic", "Pi provider ID")
+	modelName := flag.String("model", defaultModel, "Pi model ID")
+	extensionsFlag := flag.String("extensions", "", "comma-separated explicit Pi extension paths")
 	seed := flag.Int64("seed", 20260816, "randomization seed")
 	workers := flag.Int("workers", 2, "parallel randomized workers")
 	hardMinutes := flag.Int("hard-minutes", 12, "hard budget per model attempt")
@@ -116,6 +123,7 @@ func main() {
 	repetitions := flag.Int("repetitions", 1, "paired repetitions of every arm")
 	armsFlag := flag.String("arms", strings.Join(defaultArmIDs, ","), "comma-separated experiment arms")
 	driver := flag.String("driver", "real", "execution driver: real or deterministic")
+	isolation := flag.String("isolation", "bwrap", "real-driver isolation: bwrap or macos-sandbox")
 	schedule := flag.String("schedule", "paired", "execution schedule: paired (adjacent task arms) or grouped (throughput-oriented)")
 	injectFirstStallTasks := flag.String("inject-first-stall-tasks", "", "comma-separated tasks whose first request simulates a stalled worker")
 	faultStallSeconds := flag.Int("fault-stall-seconds", 12, "duration of each injected stalled worker")
@@ -126,8 +134,23 @@ func main() {
 	if *workers < 1 || *hardMinutes < 1 || *repetitions < 1 || *firstProgressSeconds < 1 || *idleSeconds < 1 || *faultStallSeconds < 1 {
 		fatalf("workers, repetitions, and timeout values must be positive")
 	}
+	if strings.TrimSpace(*provider) == "" || strings.TrimSpace(*modelName) == "" {
+		fatalf("provider and model must be non-empty")
+	}
+	var extensions []string
+	for _, extension := range strings.Split(*extensionsFlag, ",") {
+		if extension = strings.TrimSpace(extension); extension != "" {
+			if !fileExists(extension) {
+				fatalf("extension does not exist: %s", extension)
+			}
+			extensions = append(extensions, extension)
+		}
+	}
 	if *driver != "real" && *driver != "deterministic" {
 		fatalf("driver must be real or deterministic")
+	}
+	if *isolation != "bwrap" && *isolation != "macos-sandbox" {
+		fatalf("isolation must be bwrap or macos-sandbox")
 	}
 	if *schedule != "paired" && *schedule != "grouped" {
 		fatalf("schedule must be paired or grouped")
@@ -179,7 +202,7 @@ func main() {
 	must(writeJSON(filepath.Join(runRoot, "arm_catalog.json"), profiles))
 	must(writeJSON(filepath.Join(runRoot, "run_metadata.json"), map[string]any{
 		"schema_version": 2, "run_id": *runID, "created_at": time.Now().UTC().Format(time.RFC3339Nano),
-		"driver": *driver, "model": model, "seed": *seed, "workers_per_cell": *workers, "schedule": *schedule,
+		"driver": *driver, "isolation": *isolation, "provider": *provider, "model": *modelName, "extensions": extensions, "seed": *seed, "workers_per_cell": *workers, "schedule": *schedule,
 		"environment_id": strings.TrimSpace(*environmentID), "git_revision": gitRevision(),
 		"selected_task_catalog_sha256": jsonSHA256(tasks), "arm_catalog_sha256": jsonSHA256(profiles),
 		"selected_task_catalog_file_sha256": fileSHA256(filepath.Join(runRoot, "selected_task_catalog.json")),
@@ -206,13 +229,14 @@ func main() {
 	for _, cell := range cells {
 		fmt.Printf("CELL %02d/%02d arm=%s repetition=%d issues=%d\n", cell.OrderIndex, len(cells), cell.Arm.ID, cell.Repetition, len(cell.Tasks))
 		e := &evaluator{
-			runRoot: runRoot, piPath: *piPath, piConfig: *piConfig, seed: *seed,
+			runRoot: runRoot, piPath: *piPath, piConfig: *piConfig, provider: *provider, model: *modelName, extensions: extensions, seed: *seed,
 			hardTimeout:          time.Duration(*hardMinutes) * time.Minute,
 			firstProgressTimeout: time.Duration(*firstProgressSeconds) * time.Second,
 			idleTimeout:          time.Duration(*idleSeconds) * time.Second,
 			profile:              cell.Arm, repetition: cell.Repetition,
 			requestsByWorkspace: make(map[string][]requestMetric),
 			driver:              *driver,
+			isolation:           *isolation,
 			faultTasks:          faultTasks,
 			faultStall:          time.Duration(*faultStallSeconds) * time.Second,
 			faultInjected:       make(map[string]bool),
@@ -519,17 +543,32 @@ func (e *evaluator) pi(dir, label, prompt string) (usage, error) {
 	guestSession := filepath.Join("/workspace", "model-logs", sessionName)
 	reused := e.profile.SessionReuse && fileExists(sessionHost)
 	usageBefore := parseUsage(sessionHost)
-	toolRoot := filepath.Clean(filepath.Join(filepath.Dir(e.piPath), "..", ".."))
-	guestPi := "/tooling/node_modules/.bin/pi"
-	args := []string{"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64", "--ro-bind", "/etc", "/etc", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/home", "--dir", "/home/agent", "--bind", dir, "/workspace"}
-	if fileExists("/mnt/wsl/resolv.conf") {
-		args = append(args, "--dir", "/mnt", "--dir", "/mnt/wsl", "--ro-bind", "/mnt/wsl/resolv.conf", "/mnt/wsl/resolv.conf")
+	piArgs := []string{"-p", "--mode", "json", "--provider", e.provider, "--model", e.model, "--no-context-files", "--no-skills", "--no-extensions", "--no-prompt-templates", "--no-themes", "--approve"}
+	for _, extension := range e.extensions {
+		piArgs = append(piArgs, "--extension", extension)
 	}
-	args = append(args, "--ro-bind", toolRoot, "/tooling", "--ro-bind", e.piConfig, "/pi-config", "--chdir", "/workspace", guestPi, "-p", "--mode", "json", "--session", guestSession, "--provider", "deepseek-anthropic", "--model", model, "--no-context-files", "--no-skills")
-	cmd := exec.Command("bwrap", args...)
-	cmd.Dir = "/"
+	var cmd *exec.Cmd
+	if e.isolation == "macos-sandbox" {
+		piArgs = append(piArgs, "--session", sessionHost)
+		profile := fmt.Sprintf("(version 1)(allow default)(deny file-write* (subpath %q))(allow file-write* (subpath %q))(allow file-write* (subpath %q))", filepath.Dir(e.runRoot), dir, os.TempDir())
+		cmd = exec.Command("/usr/bin/sandbox-exec", append([]string{"-p", profile, e.piPath}, piArgs...)...)
+		cmd.Dir = dir
+		cmd.Env = append(cleanProxyEnv(os.Environ()), "PI_CODING_AGENT_DIR="+e.piConfig, "PI_TELEMETRY=0")
+	} else {
+		toolRoot := filepath.Clean(filepath.Join(filepath.Dir(e.piPath), "..", ".."))
+		guestPi := "/tooling/node_modules/.bin/pi"
+		args := []string{"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64", "--ro-bind", "/etc", "/etc", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/home", "--dir", "/home/agent", "--bind", dir, "/workspace"}
+		if fileExists("/mnt/wsl/resolv.conf") {
+			args = append(args, "--dir", "/mnt", "--dir", "/mnt/wsl", "--ro-bind", "/mnt/wsl/resolv.conf", "/mnt/wsl/resolv.conf")
+		}
+		piArgs = append(piArgs, "--session", guestSession)
+		args = append(args, "--ro-bind", toolRoot, "/tooling", "--ro-bind", e.piConfig, "/pi-config", "--chdir", "/workspace", guestPi)
+		args = append(args, piArgs...)
+		cmd = exec.Command("bwrap", args...)
+		cmd.Dir = "/"
+		cmd.Env = append(cleanProxyEnv(os.Environ()), "PI_CODING_AGENT_DIR=/pi-config", "PI_TELEMETRY=0", "HOME=/home/agent")
+	}
 	cmd.Stdin = strings.NewReader(prompt)
-	cmd.Env = append(cleanProxyEnv(os.Environ()), "PI_CODING_AGENT_DIR=/pi-config", "PI_TELEMETRY=0", "HOME=/home/agent")
 	observed := runObservedCommand(cmd, observedCommandOptions{
 		Guard:                e.profile.ProgressGuard,
 		HardTimeout:          e.hardTimeout,

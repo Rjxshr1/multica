@@ -52,6 +52,40 @@ schedule. Raw provider transcripts remain excluded from Git, but the per-job
 metrics and manifest are required evidence; a six-line aggregate CSV is not a
 formal A/B artifact.
 
+### Clean paired run on macOS with mcli
+
+The macOS runner uses `sandbox-exec` to keep each task inside its generated
+workspace while preserving the local provider credential path. Disable Pi's
+ambient extensions and load only the two recorded compatibility extensions:
+
+```bash
+go run . \
+  --driver real \
+  --output /absolute/path/to/eval-runs \
+  --run-id clean-ab-seed-202608281 \
+  --pi /absolute/path/to/pi \
+  --pi-config /absolute/path/to/.pi/agent \
+  --provider mcli \
+  --model deepseek-v4-pro \
+  --extensions /absolute/path/to/mcli-compat.ts,/absolute/path/to/flatten-deepseek-content.js \
+  --environment-id macbook-pi-mcli-deepseek-v4-pro \
+  --isolation macos-sandbox \
+  --schedule paired \
+  --workers 1 \
+  --repetitions 2 \
+  --arms guard,reuse \
+  --hard-minutes 5 \
+  --first-progress-seconds 180 \
+  --idle-seconds 420 \
+  --seed 202608281
+```
+
+Run five independent seeds with the same revision, task/arm catalogs,
+environment, provider, model, extensions, worker count, and timeout budgets.
+The analyzer fails closed when any of those fields differ. A partial run or a
+run containing outcome-discordant pairs remains diagnostic and must not be
+quoted as a formal latency or Token benefit.
+
 ## Publish a clean paired metric
 
 ```bash
