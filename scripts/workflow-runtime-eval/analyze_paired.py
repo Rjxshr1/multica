@@ -31,6 +31,7 @@ def file_sha256(path):
 def arm_summary(rows):
     durations = [row["duration_ms"] for row in rows]
     tokens = [row["usage"]["total_tokens"] for row in rows]
+    request_durations = [request["duration_ms"] for row in rows for request in row["requests"]]
     return {
         "n": len(rows),
         "passed": sum(bool(row["final_passed"]) for row in rows),
@@ -41,6 +42,10 @@ def arm_summary(rows):
         "tokens_p95": percentile(tokens, 0.95),
         "tokens_p99": percentile(tokens, 0.99),
         "tokens_total": sum(tokens),
+        "model_request_n": len(request_durations),
+        "model_request_duration_p50_ms": round(statistics.median(request_durations)) if request_durations else None,
+        "model_request_duration_p95_ms": percentile(request_durations, 0.95),
+        "model_request_duration_p99_ms": percentile(request_durations, 0.99),
     }
 
 
@@ -168,6 +173,9 @@ def validate_run(run, expected_arms):
         requests = row.get("requests") or []
         if row.get("model_calls") != len(requests):
             errors.append(f"{run}: {key}/{row.get('arm')} model_calls != request_count")
+        for index, request in enumerate(requests):
+            if not isinstance(request.get("duration_ms"), int) or request.get("duration_ms", 0) <= 0:
+                errors.append(f"{run}: {key}/{row.get('arm')} request {index + 1} has invalid duration")
         reused_flags = [bool(request.get("session_reused")) for request in requests]
         if row.get("arm") == "guard" and any(reused_flags):
             errors.append(f"{run}: {key}/guard unexpectedly reused a session")

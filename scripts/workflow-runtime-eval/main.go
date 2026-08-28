@@ -53,6 +53,12 @@ type usage struct {
 	Cost       float64 `json:"reported_cost"`
 }
 
+type workspaceFileSnapshot struct {
+	Data       []byte
+	Mode       os.FileMode
+	LinkTarget string
+}
+
 type result struct {
 	Arm                     string          `json:"arm"`
 	Repetition              int             `json:"repetition"`
@@ -545,6 +551,8 @@ func (e *evaluator) pi(dir, label, prompt string) (usage, error) {
 	}
 	logDir := filepath.Join(dir, "model-logs")
 	must(os.MkdirAll(logDir, 0o755))
+	workspaceSnapshot, err := snapshotWorkspace(dir)
+	must(err)
 	sessionName := label + ".session.jsonl"
 	if e.profile.SessionReuse {
 		sessionName = "issue.session.jsonl"
@@ -599,9 +607,7 @@ func (e *evaluator) pi(dir, label, prompt string) (usage, error) {
 			Workspace:            dir,
 			SessionPath:          sessionHost,
 		})
-		attemptUsage := parseUsage(sessionHost)
-		attemptUsage.subtract(usageBefore)
-		if !isProviderQuotaResponse(observed.Output, sessionHost, attemptUsage) {
+		if !isProviderQuotaResponse(observed.Output, sessionHost) {
 			break
 		}
 		quotaResponses++
@@ -611,6 +617,7 @@ func (e *evaluator) pi(dir, label, prompt string) (usage, error) {
 		} else if err := os.Remove(sessionHost); err != nil && !os.IsNotExist(err) {
 			must(err)
 		}
+		must(restoreWorkspace(dir, workspaceSnapshot))
 		waitUntil := time.Now().Truncate(time.Hour).Add(time.Hour).Add(time.Duration(5+(e.seed%5)*3) * time.Second)
 		wait := time.Until(waitUntil)
 		if wait < time.Second {
@@ -641,16 +648,99 @@ func (e *evaluator) pi(dir, label, prompt string) (usage, error) {
 	return u, nil
 }
 
-func isProviderQuotaResponse(output []byte, sessionPath string, attemptUsage usage) bool {
-	if attemptUsage.Total != 0 || attemptUsage.Input != 0 || attemptUsage.Output != 0 || attemptUsage.CacheRead != 0 || attemptUsage.CacheWrite != 0 {
-		return false
-	}
+func isProviderQuotaResponse(output []byte, sessionPath string) bool {
 	payload := append([]byte(nil), output...)
 	if session, err := os.ReadFile(sessionPath); err == nil {
 		payload = append(payload, session...)
 	}
 	text := strings.ToLower(string(payload))
 	return strings.Contains(text, "cost-quota-") || strings.Contains(text, "当前小时请求过于频繁，请下个整点重试")
+}
+
+func snapshotWorkspace(dir string) (map[string]workspaceFileSnapshot, error) {
+	snapshot := make(map[string]workspaceFileSnapshot)
+	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		top := strings.Split(rel, string(os.PathSeparator))[0]
+		if top == "model-logs" || top == ".git" {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			snapshot[rel] = workspaceFileSnapshot{Mode: info.Mode(), LinkTarget: target}
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		snapshot[rel] = workspaceFileSnapshot{Data: data, Mode: info.Mode()}
+		return nil
+	})
+	return snapshot, err
+}
+
+func restoreWorkspace(dir string, snapshot map[string]workspaceFileSnapshot) error {
+	cleanDir := filepath.Clean(dir)
+	if cleanDir == "." || cleanDir == string(os.PathSeparator) {
+		return fmt.Errorf("refusing to restore unsafe workspace %q", dir)
+	}
+	entries, err := os.ReadDir(cleanDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() == "model-logs" || entry.Name() == ".git" {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(cleanDir, entry.Name())); err != nil {
+			return err
+		}
+	}
+	paths := make([]string, 0, len(snapshot))
+	for rel := range snapshot {
+		paths = append(paths, rel)
+	}
+	sort.Strings(paths)
+	for _, rel := range paths {
+		state := snapshot[rel]
+		path := filepath.Join(cleanDir, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		if state.Mode&os.ModeSymlink != 0 {
+			if err := os.Symlink(state.LinkTarget, path); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.WriteFile(path, state.Data, state.Mode.Perm()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runVerifier(dir string, v verifier) (bool, string) {

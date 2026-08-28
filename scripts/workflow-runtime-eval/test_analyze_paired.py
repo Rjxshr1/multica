@@ -39,7 +39,10 @@ def make_run(root, seed, corrupt_reuse=False):
                 actual_order += 1
                 started = base_time + timedelta(seconds=actual_order * 2)
                 finished = started + timedelta(seconds=1)
-                requests = [{"session_reused": False, "termination": "completed"}, {"session_reused": arm == "reuse", "termination": "completed"}]
+                requests = [
+                    {"session_reused": False, "termination": "completed", "duration_ms": 600},
+                    {"session_reused": arm == "reuse", "termination": "completed", "duration_ms": 400},
+                ]
                 if corrupt_reuse and repetition == 1 and task_index == 0 and arm == "reuse":
                     requests[1]["session_reused"] = False
                 rows.append({
@@ -95,6 +98,9 @@ class PairedAnalysisTest(unittest.TestCase):
             self.assertEqual("FORMAL", report["status"])
             self.assertTrue((base / "out" / "formal_metrics.json").is_file())
             self.assertEqual(15, report["gates"]["p95_upper_tail_observations"])
+            formal = json.loads((base / "out" / "formal_metrics.json").read_text())
+            self.assertEqual(600, formal["by_arm"]["guard"]["model_request_n"])
+            self.assertEqual(600, formal["by_arm"]["guard"]["model_request_duration_p99_ms"])
 
     def test_duplicate_run_is_rejected_as_dirty(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -61,15 +61,56 @@ func TestWritePerJobCSVPreservesPairAndReuseEvidence(t *testing.T) {
 	}
 }
 
-func TestProviderQuotaResponseRequiresMarkerAndZeroUsage(t *testing.T) {
+func TestProviderQuotaResponseRecognizesMarkerAfterPriorUsage(t *testing.T) {
 	session := filepath.Join(t.TempDir(), "session.jsonl")
 	if err := os.WriteFile(session, []byte(`{"responseId":"cost-quota-123","text":"当前小时请求过于频繁，请下个整点重试"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if !isProviderQuotaResponse(nil, session, usage{}) {
-		t.Fatal("zero-usage quota response was not detected")
+	if !isProviderQuotaResponse(nil, session) {
+		t.Fatal("quota response was not detected")
 	}
-	if isProviderQuotaResponse(nil, session, usage{Total: 1}) {
-		t.Fatal("non-zero usage must not be classified as an environment quota response")
+	if isProviderQuotaResponse([]byte(`{"responseId":"normal-response"}`), filepath.Join(t.TempDir(), "missing.jsonl")) {
+		t.Fatal("ordinary response was classified as an environment quota response")
+	}
+}
+
+func TestRestoreWorkspaceRollsBackFilesButPreservesLogs(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "model-logs")
+	if err := os.MkdirAll(logs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := filepath.Join(dir, "src", "index.js")
+	if err := os.MkdirAll(filepath.Dir(original), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(original, []byte("original\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := snapshotWorkspace(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(original, []byte("partial quota mutation\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "new.js"), []byte("partial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(logs, "quota.log"), []byte("quota\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreWorkspace(dir, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(original)
+	if err != nil || string(payload) != "original\n" {
+		t.Fatalf("original file was not restored: payload=%q err=%v", payload, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "new.js")); !os.IsNotExist(err) {
+		t.Fatalf("new file survived rollback: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(logs, "quota.log")); err != nil {
+		t.Fatalf("quota evidence was not preserved: %v", err)
 	}
 }
