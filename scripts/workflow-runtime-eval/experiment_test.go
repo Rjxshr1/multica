@@ -40,7 +40,7 @@ func TestWritePerJobCSVPreservesPairAndReuseEvidence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "per_job.csv")
 	items := []result{{
 		Arm: "reuse", Seed: 7, Repetition: 2, TaskID: "task-a", Category: "fixture", Difficulty: "medium",
-		FinalPassed: true, FirstPassSuccess: false, Recovered: true, DurationMS: 1234, ModelCalls: 2,
+		FinalPassed: true, FirstPassSuccess: false, Recovered: true, DurationMS: 1234, EnvironmentWaitMS: 5000, ModelCalls: 2,
 		Usage: usage{Total: 900, CacheRead: 400}, StartedAt: "2026-08-25T00:00:00Z", FinishedAt: "2026-08-25T00:00:01Z",
 		Requests: []requestMetric{{Termination: "completed"}, {Termination: "completed", SessionReused: true}},
 	}}
@@ -56,7 +56,20 @@ func TestWritePerJobCSVPreservesPairAndReuseEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 2 || rows[1][0] != "7/2/task-a" || rows[1][15] != "1" || rows[1][16] != "2" {
+	if len(rows) != 2 || rows[1][0] != "7/2/task-a" || rows[1][11] != "5000" || rows[1][16] != "1" || rows[1][17] != "2" {
 		t.Fatalf("unexpected CSV rows: %#v", rows)
+	}
+}
+
+func TestProviderQuotaResponseRequiresMarkerAndZeroUsage(t *testing.T) {
+	session := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(session, []byte(`{"responseId":"cost-quota-123","text":"当前小时请求过于频繁，请下个整点重试"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !isProviderQuotaResponse(nil, session, usage{}) {
+		t.Fatal("zero-usage quota response was not detected")
+	}
+	if isProviderQuotaResponse(nil, session, usage{Total: 1}) {
+		t.Fatal("non-zero usage must not be classified as an environment quota response")
 	}
 }

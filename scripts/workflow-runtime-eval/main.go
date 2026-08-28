@@ -70,6 +70,7 @@ type result struct {
 	StartedAt               string          `json:"started_at"`
 	FinishedAt              string          `json:"finished_at"`
 	DurationMS              int64           `json:"duration_ms"`
+	EnvironmentWaitMS       int64           `json:"environment_wait_ms"`
 	ModelCalls              int             `json:"model_calls"`
 	GuardRecoveries         int             `json:"guard_recoveries"`
 	Usage                   usage           `json:"usage"`
@@ -86,25 +87,26 @@ type job struct {
 }
 
 type evaluator struct {
-	runRoot              string
-	piPath               string
-	piConfig             string
-	provider             string
-	model                string
-	extensions           []string
-	seed                 int64
-	hardTimeout          time.Duration
-	firstProgressTimeout time.Duration
-	idleTimeout          time.Duration
-	profile              armProfile
-	repetition           int
-	requestMu            sync.Mutex
-	requestsByWorkspace  map[string][]requestMetric
-	driver               string
-	isolation            string
-	faultTasks           map[string]bool
-	faultStall           time.Duration
-	faultInjected        map[string]bool
+	runRoot                    string
+	piPath                     string
+	piConfig                   string
+	provider                   string
+	model                      string
+	extensions                 []string
+	seed                       int64
+	hardTimeout                time.Duration
+	firstProgressTimeout       time.Duration
+	idleTimeout                time.Duration
+	profile                    armProfile
+	repetition                 int
+	requestMu                  sync.Mutex
+	requestsByWorkspace        map[string][]requestMetric
+	environmentWaitByWorkspace map[string]time.Duration
+	driver                     string
+	isolation                  string
+	faultTasks                 map[string]bool
+	faultStall                 time.Duration
+	faultInjected              map[string]bool
 }
 
 func main() {
@@ -234,12 +236,13 @@ func main() {
 			firstProgressTimeout: time.Duration(*firstProgressSeconds) * time.Second,
 			idleTimeout:          time.Duration(*idleSeconds) * time.Second,
 			profile:              cell.Arm, repetition: cell.Repetition,
-			requestsByWorkspace: make(map[string][]requestMetric),
-			driver:              *driver,
-			isolation:           *isolation,
-			faultTasks:          faultTasks,
-			faultStall:          time.Duration(*faultStallSeconds) * time.Second,
-			faultInjected:       make(map[string]bool),
+			requestsByWorkspace:        make(map[string][]requestMetric),
+			environmentWaitByWorkspace: make(map[string]time.Duration),
+			driver:                     *driver,
+			isolation:                  *isolation,
+			faultTasks:                 faultTasks,
+			faultStall:                 time.Duration(*faultStallSeconds) * time.Second,
+			faultInjected:              make(map[string]bool),
 		}
 		cellStarted := time.Now()
 		queue := make(chan job)
@@ -297,6 +300,7 @@ func (e *evaluator) run(item job) result {
 	r := result{Arm: item.Profile.ID, Repetition: item.Repetition, TaskID: item.Task.ID, Category: item.Task.Category, Difficulty: item.Task.Difficulty, OrderIndex: item.Index, Seed: e.seed, BudgetSeconds: int(e.hardTimeout.Seconds()), StartedAt: started.UTC().Format(time.RFC3339Nano)}
 	e.requestMu.Lock()
 	e.requestsByWorkspace[dir] = nil
+	e.environmentWaitByWorkspace[dir] = 0
 	e.requestMu.Unlock()
 	var calls int
 	var tokens usage
@@ -320,11 +324,17 @@ func (e *evaluator) run(item job) result {
 	r.Reason, r.ModelCalls, r.Usage, r.Events = compact(why), calls, tokens, events
 	finished := time.Now()
 	r.FinishedAt = finished.UTC().Format(time.RFC3339Nano)
-	r.DurationMS = finished.Sub(started).Milliseconds()
 	e.requestMu.Lock()
+	environmentWait := e.environmentWaitByWorkspace[dir]
+	delete(e.environmentWaitByWorkspace, dir)
 	r.Requests = append([]requestMetric(nil), e.requestsByWorkspace[dir]...)
 	delete(e.requestsByWorkspace, dir)
 	e.requestMu.Unlock()
+	r.EnvironmentWaitMS = environmentWait.Milliseconds()
+	r.DurationMS = (finished.Sub(started) - environmentWait).Milliseconds()
+	if r.DurationMS < 1 {
+		r.DurationMS = 1
+	}
 	for _, request := range r.Requests {
 		if request.Termination == "no_first_progress" || request.Termination == "idle_no_progress" || request.Termination == "hard_deadline" {
 			r.GuardRecoveries++
@@ -542,41 +552,77 @@ func (e *evaluator) pi(dir, label, prompt string) (usage, error) {
 	sessionHost := filepath.Join(logDir, sessionName)
 	guestSession := filepath.Join("/workspace", "model-logs", sessionName)
 	reused := e.profile.SessionReuse && fileExists(sessionHost)
+	sessionExisted := fileExists(sessionHost)
+	var sessionSnapshot []byte
+	if sessionExisted {
+		sessionSnapshot, _ = os.ReadFile(sessionHost)
+	}
 	usageBefore := parseUsage(sessionHost)
 	piArgs := []string{"-p", "--mode", "json", "--provider", e.provider, "--model", e.model, "--no-context-files", "--no-skills", "--no-extensions", "--no-prompt-templates", "--no-themes", "--approve"}
 	for _, extension := range e.extensions {
 		piArgs = append(piArgs, "--extension", extension)
 	}
-	var cmd *exec.Cmd
-	if e.isolation == "macos-sandbox" {
-		piArgs = append(piArgs, "--session", sessionHost)
-		profile := fmt.Sprintf("(version 1)(allow default)(deny file-write* (subpath %q))(allow file-write* (subpath %q))(allow file-write* (subpath %q))", filepath.Dir(e.runRoot), dir, os.TempDir())
-		cmd = exec.Command("/usr/bin/sandbox-exec", append([]string{"-p", profile, e.piPath}, piArgs...)...)
-		cmd.Dir = dir
-		cmd.Env = append(cleanProxyEnv(os.Environ()), "PI_CODING_AGENT_DIR="+e.piConfig, "PI_TELEMETRY=0")
-	} else {
-		toolRoot := filepath.Clean(filepath.Join(filepath.Dir(e.piPath), "..", ".."))
-		guestPi := "/tooling/node_modules/.bin/pi"
-		args := []string{"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64", "--ro-bind", "/etc", "/etc", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/home", "--dir", "/home/agent", "--bind", dir, "/workspace"}
-		if fileExists("/mnt/wsl/resolv.conf") {
-			args = append(args, "--dir", "/mnt", "--dir", "/mnt/wsl", "--ro-bind", "/mnt/wsl/resolv.conf", "/mnt/wsl/resolv.conf")
+	newCommand := func() *exec.Cmd {
+		argsForPi := append([]string(nil), piArgs...)
+		var cmd *exec.Cmd
+		if e.isolation == "macos-sandbox" {
+			argsForPi = append(argsForPi, "--session", sessionHost)
+			profile := fmt.Sprintf("(version 1)(allow default)(deny file-write* (subpath %q))(allow file-write* (subpath %q))(allow file-write* (subpath %q))", filepath.Dir(e.runRoot), dir, os.TempDir())
+			cmd = exec.Command("/usr/bin/sandbox-exec", append([]string{"-p", profile, e.piPath}, argsForPi...)...)
+			cmd.Dir = dir
+			cmd.Env = append(cleanProxyEnv(os.Environ()), "PI_CODING_AGENT_DIR="+e.piConfig, "PI_TELEMETRY=0")
+		} else {
+			toolRoot := filepath.Clean(filepath.Join(filepath.Dir(e.piPath), "..", ".."))
+			guestPi := "/tooling/node_modules/.bin/pi"
+			args := []string{"--die-with-parent", "--new-session", "--unshare-all", "--share-net", "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64", "--ro-bind", "/etc", "/etc", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/home", "--dir", "/home/agent", "--bind", dir, "/workspace"}
+			if fileExists("/mnt/wsl/resolv.conf") {
+				args = append(args, "--dir", "/mnt", "--dir", "/mnt/wsl", "--ro-bind", "/mnt/wsl/resolv.conf", "/mnt/wsl/resolv.conf")
+			}
+			argsForPi = append(argsForPi, "--session", guestSession)
+			args = append(args, "--ro-bind", toolRoot, "/tooling", "--ro-bind", e.piConfig, "/pi-config", "--chdir", "/workspace", guestPi)
+			args = append(args, argsForPi...)
+			cmd = exec.Command("bwrap", args...)
+			cmd.Dir = "/"
+			cmd.Env = append(cleanProxyEnv(os.Environ()), "PI_CODING_AGENT_DIR=/pi-config", "PI_TELEMETRY=0", "HOME=/home/agent")
 		}
-		piArgs = append(piArgs, "--session", guestSession)
-		args = append(args, "--ro-bind", toolRoot, "/tooling", "--ro-bind", e.piConfig, "/pi-config", "--chdir", "/workspace", guestPi)
-		args = append(args, piArgs...)
-		cmd = exec.Command("bwrap", args...)
-		cmd.Dir = "/"
-		cmd.Env = append(cleanProxyEnv(os.Environ()), "PI_CODING_AGENT_DIR=/pi-config", "PI_TELEMETRY=0", "HOME=/home/agent")
+		cmd.Stdin = strings.NewReader(prompt)
+		return cmd
 	}
-	cmd.Stdin = strings.NewReader(prompt)
-	observed := runObservedCommand(cmd, observedCommandOptions{
-		Guard:                e.profile.ProgressGuard,
-		HardTimeout:          e.hardTimeout,
-		FirstProgressTimeout: e.firstProgressTimeout,
-		IdleTimeout:          e.idleTimeout,
-		Workspace:            dir,
-		SessionPath:          sessionHost,
-	})
+	quotaResponses := 0
+	var observed observedCommandResult
+	for {
+		observed = runObservedCommand(newCommand(), observedCommandOptions{
+			Guard:                e.profile.ProgressGuard,
+			HardTimeout:          e.hardTimeout,
+			FirstProgressTimeout: e.firstProgressTimeout,
+			IdleTimeout:          e.idleTimeout,
+			Workspace:            dir,
+			SessionPath:          sessionHost,
+		})
+		attemptUsage := parseUsage(sessionHost)
+		attemptUsage.subtract(usageBefore)
+		if !isProviderQuotaResponse(observed.Output, sessionHost, attemptUsage) {
+			break
+		}
+		quotaResponses++
+		must(os.WriteFile(filepath.Join(logDir, fmt.Sprintf("%s.quota-%02d.log", label, quotaResponses)), observed.Output, 0o644))
+		if sessionExisted {
+			must(os.WriteFile(sessionHost, sessionSnapshot, 0o644))
+		} else if err := os.Remove(sessionHost); err != nil && !os.IsNotExist(err) {
+			must(err)
+		}
+		waitUntil := time.Now().Truncate(time.Hour).Add(time.Hour).Add(time.Duration(5+(e.seed%5)*3) * time.Second)
+		wait := time.Until(waitUntil)
+		if wait < time.Second {
+			wait = time.Second
+		}
+		fmt.Printf("  provider quota arm=%s task=%s; pausing %s until %s\n", e.profile.ID, filepath.Base(dir), wait.Round(time.Second), waitUntil.Format(time.RFC3339))
+		waitStarted := time.Now()
+		time.Sleep(wait)
+		e.requestMu.Lock()
+		e.environmentWaitByWorkspace[dir] += time.Since(waitStarted)
+		e.requestMu.Unlock()
+	}
 	must(os.WriteFile(filepath.Join(logDir, label+".output.log"), observed.Output, 0o644))
 	u := parseUsage(sessionHost)
 	if reused {
@@ -593,6 +639,18 @@ func (e *evaluator) pi(dir, label, prompt string) (usage, error) {
 		return u, fmt.Errorf("Pi/DeepSeek failed (%s): %v", observed.Termination, err)
 	}
 	return u, nil
+}
+
+func isProviderQuotaResponse(output []byte, sessionPath string, attemptUsage usage) bool {
+	if attemptUsage.Total != 0 || attemptUsage.Input != 0 || attemptUsage.Output != 0 || attemptUsage.CacheRead != 0 || attemptUsage.CacheWrite != 0 {
+		return false
+	}
+	payload := append([]byte(nil), output...)
+	if session, err := os.ReadFile(sessionPath); err == nil {
+		payload = append(payload, session...)
+	}
+	text := strings.ToLower(string(payload))
+	return strings.Contains(text, "cost-quota-") || strings.Contains(text, "当前小时请求过于频繁，请下个整点重试")
 }
 
 func runVerifier(dir string, v verifier) (bool, string) {
@@ -833,7 +891,7 @@ func writePerJobCSV(path string, results []result) error {
 	defer handle.Close()
 	w := csv.NewWriter(handle)
 	defer w.Flush()
-	if err := w.Write([]string{"pair_key", "seed", "repetition", "task_id", "arm", "category", "difficulty", "final_passed", "first_pass_success", "recovered", "duration_ms", "model_calls", "total_tokens", "cache_read_tokens", "guard_recoveries", "reused_requests", "request_count", "started_at", "finished_at", "termination_reasons"}); err != nil {
+	if err := w.Write([]string{"pair_key", "seed", "repetition", "task_id", "arm", "category", "difficulty", "final_passed", "first_pass_success", "recovered", "duration_ms", "environment_wait_ms", "model_calls", "total_tokens", "cache_read_tokens", "guard_recoveries", "reused_requests", "request_count", "started_at", "finished_at", "termination_reasons"}); err != nil {
 		return err
 	}
 	for _, item := range results {
@@ -847,7 +905,7 @@ func writePerJobCSV(path string, results []result) error {
 		}
 		row := []string{
 			fmt.Sprintf("%d/%d/%s", item.Seed, item.Repetition, item.TaskID), strconv.FormatInt(item.Seed, 10), strconv.Itoa(item.Repetition), item.TaskID, item.Arm, item.Category, item.Difficulty,
-			strconv.FormatBool(item.FinalPassed), strconv.FormatBool(item.FirstPassSuccess), strconv.FormatBool(item.Recovered), strconv.FormatInt(item.DurationMS, 10), strconv.Itoa(item.ModelCalls), strconv.FormatInt(item.Usage.Total, 10), strconv.FormatInt(item.Usage.CacheRead, 10), strconv.Itoa(item.GuardRecoveries), strconv.Itoa(reused), strconv.Itoa(len(item.Requests)), item.StartedAt, item.FinishedAt, strings.Join(terminations, ";"),
+			strconv.FormatBool(item.FinalPassed), strconv.FormatBool(item.FirstPassSuccess), strconv.FormatBool(item.Recovered), strconv.FormatInt(item.DurationMS, 10), strconv.FormatInt(item.EnvironmentWaitMS, 10), strconv.Itoa(item.ModelCalls), strconv.FormatInt(item.Usage.Total, 10), strconv.FormatInt(item.Usage.CacheRead, 10), strconv.Itoa(item.GuardRecoveries), strconv.Itoa(reused), strconv.Itoa(len(item.Requests)), item.StartedAt, item.FinishedAt, strings.Join(terminations, ";"),
 		}
 		if err := w.Write(row); err != nil {
 			return err

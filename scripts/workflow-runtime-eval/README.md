@@ -86,6 +86,11 @@ The analyzer fails closed when any of those fields differ. A partial run or a
 run containing outcome-discordant pairs remains diagnostic and must not be
 quoted as a formal latency or Token benefit.
 
+The mcli hourly quota response carries zero usage and a `cost-quota-*`
+response ID. The runner restores the pre-request Session journal, pauses until
+the next hour, and retries the same request. Quota wait is excluded from
+`duration_ms` and recorded separately as `environment_wait_ms`.
+
 ## Publish a clean paired metric
 
 ```bash
