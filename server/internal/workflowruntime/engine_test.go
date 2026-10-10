@@ -350,3 +350,60 @@ func mustReport(t *testing.T, engine *Engine, lease Lease, commandID string) {
 		t.Fatal(err)
 	}
 }
+
+func TestClaimReplayReturnsTheLeaseItCreated(t *testing.T) {
+	engine := NewEngine(NewMemoryEventStore())
+	if err := engine.Create(WorkflowSpec{ID: "run", Nodes: []NodeSpec{{ID: "node", MaxAttempts: 3}}}, "create"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := engine.Claim("run", "node", "claim-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.FailAttempt(first, FailureUnclassified, "fail-a"); err != nil {
+		t.Fatal(err)
+	}
+	second, err := engine.Claim("run", "node", "claim-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := engine.Claim("run", "node", "claim-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay != first {
+		t.Fatalf("replayed claim returned %+v, want original lease %+v", replay, first)
+	}
+	if err := engine.ReportTaskSucceeded(replay, "stale-report"); !errors.Is(err, ErrStaleFence) {
+		t.Fatalf("stale lease reported success: err=%v", err)
+	}
+	if err := engine.ReportTaskSucceeded(second, "report-b"); err != nil {
+		t.Fatalf("current lease rejected: %v", err)
+	}
+}
+
+func TestReusedCommandIDForDifferentOperationConflicts(t *testing.T) {
+	engine := NewEngine(NewMemoryEventStore())
+	if err := engine.Create(WorkflowSpec{ID: "run", Nodes: []NodeSpec{{ID: "a"}, {ID: "b"}}}, "create"); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := engine.Claim("run", "a", "claim-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Claim("run", "b", "claim-a"); !errors.Is(err, ErrCommandConflict) {
+		t.Fatalf("claiming another node with a used command id: err=%v", err)
+	}
+	if _, err := engine.Claim("run", "b", "create"); !errors.Is(err, ErrCommandConflict) {
+		t.Fatalf("claiming with the create command id: err=%v", err)
+	}
+	if err := engine.ReportTaskSucceeded(lease, "report"); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Verify(lease, true, "", "report"); !errors.Is(err, ErrCommandConflict) {
+		t.Fatalf("verify reusing a report command id: err=%v", err)
+	}
+	if err := engine.ReportTaskSucceeded(lease, "report"); err != nil {
+		t.Fatalf("exact replay should succeed: %v", err)
+	}
+}

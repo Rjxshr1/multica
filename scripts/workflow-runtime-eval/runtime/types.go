@@ -12,6 +12,10 @@ var (
 	ErrVersionConflict = errors.New("workflow run version conflict")
 	ErrInvalidState    = errors.New("invalid workflow state transition")
 	ErrStaleFence      = errors.New("stale execution fence")
+	// ErrCommandConflict reports a command ID that was already used for a
+	// different operation, node or attempt. Replaying it must not be mistaken
+	// for a successful retry of the new request.
+	ErrCommandConflict = errors.New("command id already used for a different operation")
 )
 
 type WorkflowState string
@@ -137,6 +141,9 @@ type Event struct {
 	FailureClass FailureClass  `json:"failure_class,omitempty"`
 	NodeSpec     *NodeSpec     `json:"node_spec,omitempty"`
 	BeforeNodeID string        `json:"before_node_id,omitempty"`
+	// CommandID is stamped by the store on append so a replayed command can
+	// be answered from the event it produced rather than from current state.
+	CommandID string `json:"command_id,omitempty"`
 }
 
 func (r *WorkflowRun) Node(id string) (*NodeExecution, error) {

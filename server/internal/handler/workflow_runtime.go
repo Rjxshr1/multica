@@ -234,6 +234,8 @@ func writeWorkflowError(w http.ResponseWriter, err error) {
 		writeErrorCode(w, http.StatusConflict, "stale_fence", err.Error())
 	case errors.Is(err, service.ErrWorkflowInvalidState):
 		writeErrorCode(w, http.StatusConflict, "invalid_state", err.Error())
+	case errors.Is(err, service.ErrWorkflowIdempotencyConflict):
+		writeErrorCode(w, http.StatusConflict, "idempotency_conflict", err.Error())
 	case errors.Is(err, pgx.ErrNoRows):
 		writeErrorCode(w, http.StatusNotFound, "not_found", "workflow resource not found")
 	default:

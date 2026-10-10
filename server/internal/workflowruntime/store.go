@@ -66,6 +66,7 @@ func (s *MemoryEventStore) Append(runID string, expectedVersion uint64, commandI
 	}
 	for i := range proposed {
 		proposed[i].Version = current + uint64(i) + 1
+		proposed[i].CommandID = commandID
 		s.events[runID] = append(s.events[runID], proposed[i])
 	}
 	s.commands[runID][commandID] = struct{}{}
@@ -151,6 +152,7 @@ func (s *FileEventStore) Append(runID string, expectedVersion uint64, commandID 
 	}
 	for i := range proposed {
 		proposed[i].Version = current + uint64(i) + 1
+		proposed[i].CommandID = commandID
 		next.Events[runID] = append(next.Events[runID], proposed[i])
 	}
 	next.Commands[runID][commandID] = true

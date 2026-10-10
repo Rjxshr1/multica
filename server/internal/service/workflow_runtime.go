@@ -21,7 +21,33 @@ var (
 	ErrWorkflowStaleRevision = errors.New("stale workflow revision")
 	ErrWorkflowStaleFence    = errors.New("stale workflow fence")
 	ErrWorkflowInvalidState  = errors.New("invalid workflow state")
+	// ErrWorkflowIdempotencyConflict reports a key that already identifies a
+	// different operation, node, attempt or plan in this run.
+	ErrWorkflowIdempotencyConflict = errors.New("idempotency key already used for a different workflow operation")
 )
+
+// Keys the runtime derives for its own events. Client keys must not occupy
+// them, or a later internal event of the same run would collide.
+var reservedIdempotencyPrefixes = []string{"task-complete:", "task-fail:", "workflow-fail:"}
+
+func validateClientIdempotencyKey(key string) error {
+	if strings.TrimSpace(key) == "" {
+		return fmt.Errorf("idempotency_key is required")
+	}
+	for _, prefix := range reservedIdempotencyPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return fmt.Errorf("idempotency_key prefix %q is reserved", prefix)
+		}
+	}
+	if strings.Contains(key, ":ready:") || strings.HasSuffix(key, ":run") {
+		return fmt.Errorf("idempotency_key must not contain \":ready:\" or end with \":run\"")
+	}
+	return nil
+}
+
+func idempotencyConflict(key string) error {
+	return fmt.Errorf("%w: %q", ErrWorkflowIdempotencyConflict, key)
+}
 
 type WorkflowNodeSpec struct {
 	Key                string         `json:"key"`
@@ -104,8 +130,8 @@ func (s *WorkflowRuntimeService) CreateRun(ctx context.Context, input CreateWork
 	if !input.WorkspaceID.Valid {
 		return nil, fmt.Errorf("workspace_id is required")
 	}
-	if strings.TrimSpace(input.IdempotencyKey) == "" {
-		return nil, fmt.Errorf("idempotency_key is required")
+	if err := validateClientIdempotencyKey(input.IdempotencyKey); err != nil {
+		return nil, err
 	}
 	if err := validateWorkflowPlan(input.Plan); err != nil {
 		return nil, err
@@ -147,6 +173,20 @@ func (s *WorkflowRuntimeService) CreateRun(ctx context.Context, input CreateWork
 			})
 			if lookupErr != nil {
 				return nil, fmt.Errorf("resolve idempotent workflow run: %w", lookupErr)
+			}
+			// The run's current digest changes when the plan is amended; compare
+			// against the digest recorded when this key created the run.
+			created, createdErr := s.Queries.GetWorkflowEventByIdempotencyKey(ctx, db.GetWorkflowEventByIdempotencyKeyParams{
+				RunID: existing.ID, WorkspaceID: input.WorkspaceID, IdempotencyKey: textValue(input.IdempotencyKey),
+			})
+			if createdErr != nil {
+				return nil, fmt.Errorf("resolve idempotent workflow creation: %w", createdErr)
+			}
+			var recorded struct {
+				DefinitionDigest string `json:"definition_digest"`
+			}
+			if created.EventType != "workflow.created" || json.Unmarshal(created.Payload, &recorded) != nil || recorded.DefinitionDigest != digest {
+				return nil, idempotencyConflict(input.IdempotencyKey)
 			}
 			return s.Snapshot(ctx, input.WorkspaceID, existing.ID)
 		}
@@ -231,8 +271,8 @@ func (s *WorkflowRuntimeService) Snapshot(ctx context.Context, workspaceID, runI
 // InsertNodeBefore atomically amends a running plan. The new gate inherits the
 // target's predecessors, and the target is rewired to depend only on the gate.
 func (s *WorkflowRuntimeService) InsertNodeBefore(ctx context.Context, input InsertWorkflowNodeBeforeInput) (*WorkflowSnapshot, error) {
-	if strings.TrimSpace(input.IdempotencyKey) == "" {
-		return nil, fmt.Errorf("idempotency_key is required")
+	if err := validateClientIdempotencyKey(input.IdempotencyKey); err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(input.TargetNodeKey) == "" || strings.TrimSpace(input.Node.Key) == "" {
 		return nil, fmt.Errorf("target_node_key and node.key are required")
@@ -247,7 +287,15 @@ func (s *WorkflowRuntimeService) InsertNodeBefore(ctx context.Context, input Ins
 		if err := qtx.LockWorkflowRun(ctx, util.UUIDToString(input.RunID)); err != nil {
 			return err
 		}
-		if _, err := qtx.GetWorkflowEventByIdempotencyKey(ctx, db.GetWorkflowEventByIdempotencyKeyParams{RunID: input.RunID, WorkspaceID: input.WorkspaceID, IdempotencyKey: textValue(input.IdempotencyKey)}); err == nil {
+		if event, err := qtx.GetWorkflowEventByIdempotencyKey(ctx, db.GetWorkflowEventByIdempotencyKeyParams{RunID: input.RunID, WorkspaceID: input.WorkspaceID, IdempotencyKey: textValue(input.IdempotencyKey)}); err == nil {
+			var recorded struct {
+				NodeKey       string `json:"node_key"`
+				BeforeNodeKey string `json:"before_node_key"`
+			}
+			if event.EventType != "node.inserted" || json.Unmarshal(event.Payload, &recorded) != nil ||
+				recorded.NodeKey != input.Node.Key || recorded.BeforeNodeKey != input.TargetNodeKey {
+				return idempotencyConflict(input.IdempotencyKey)
+			}
 			return nil
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return err
@@ -362,21 +410,32 @@ func (s *WorkflowRuntimeService) InsertNodeBefore(ctx context.Context, input Ins
 
 func (s *WorkflowRuntimeService) ClaimNode(ctx context.Context, workspaceID, runID pgtype.UUID, nodeKey, idempotencyKey string, actor WorkflowActor) (WorkflowLease, error) {
 	var lease WorkflowLease
-	if strings.TrimSpace(idempotencyKey) == "" {
-		return lease, fmt.Errorf("idempotency_key is required")
+	if err := validateClientIdempotencyKey(idempotencyKey); err != nil {
+		return lease, err
 	}
 	err := s.inTx(ctx, func(qtx *db.Queries) error {
 		if err := qtx.LockWorkflowRun(ctx, util.UUIDToString(runID)); err != nil {
 			return err
 		}
-		if _, err := qtx.GetWorkflowEventByIdempotencyKey(ctx, db.GetWorkflowEventByIdempotencyKeyParams{RunID: runID, WorkspaceID: workspaceID, IdempotencyKey: textValue(idempotencyKey)}); err == nil {
+		if event, err := qtx.GetWorkflowEventByIdempotencyKey(ctx, db.GetWorkflowEventByIdempotencyKeyParams{RunID: runID, WorkspaceID: workspaceID, IdempotencyKey: textValue(idempotencyKey)}); err == nil {
+			// Answer a retried claim with the attempt this key created, never the
+			// node's current attempt, which may belong to a newer claim.
+			if event.EventType != "node.claimed" || !event.AttemptID.Valid {
+				return idempotencyConflict(idempotencyKey)
+			}
 			node, err := qtx.GetWorkflowNodeByKeyForUpdate(ctx, db.GetWorkflowNodeByKeyForUpdateParams{NodeKey: nodeKey, RunID: runID, WorkspaceID: workspaceID})
+			if errors.Is(err, pgx.ErrNoRows) {
+				return idempotencyConflict(idempotencyKey)
+			}
 			if err != nil {
 				return err
 			}
-			attempt, err := qtx.GetWorkflowAttempt(ctx, db.GetWorkflowAttemptParams{ID: node.ActiveAttemptID, RunID: runID, WorkspaceID: workspaceID})
+			attempt, err := qtx.GetWorkflowAttempt(ctx, db.GetWorkflowAttemptParams{ID: event.AttemptID, RunID: runID, WorkspaceID: workspaceID})
 			if err != nil {
 				return err
+			}
+			if !sameUUID(attempt.NodeID, node.ID) {
+				return idempotencyConflict(idempotencyKey)
 			}
 			lease = leaseFromAttempt(attempt)
 			return nil
@@ -558,14 +617,21 @@ func (s *WorkflowRuntimeService) SettleTaskFailure(ctx context.Context, taskID p
 }
 
 func (s *WorkflowRuntimeService) Verify(ctx context.Context, input VerificationInput) (*WorkflowSnapshot, error) {
-	if strings.TrimSpace(input.IdempotencyKey) == "" {
-		return nil, fmt.Errorf("idempotency_key is required")
+	if err := validateClientIdempotencyKey(input.IdempotencyKey); err != nil {
+		return nil, err
 	}
 	err := s.inTx(ctx, func(qtx *db.Queries) error {
 		if err := qtx.LockWorkflowRun(ctx, util.UUIDToString(input.RunID)); err != nil {
 			return err
 		}
-		if _, err := qtx.GetWorkflowEventByIdempotencyKey(ctx, db.GetWorkflowEventByIdempotencyKeyParams{RunID: input.RunID, WorkspaceID: input.WorkspaceID, IdempotencyKey: textValue(input.IdempotencyKey)}); err == nil {
+		if event, err := qtx.GetWorkflowEventByIdempotencyKey(ctx, db.GetWorkflowEventByIdempotencyKeyParams{RunID: input.RunID, WorkspaceID: input.WorkspaceID, IdempotencyKey: textValue(input.IdempotencyKey)}); err == nil {
+			expected := "verification.rejected"
+			if input.Passed {
+				expected = "verification.passed"
+			}
+			if event.EventType != expected || !sameUUID(event.AttemptID, input.AttemptID) {
+				return idempotencyConflict(input.IdempotencyKey)
+			}
 			return nil
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return err
