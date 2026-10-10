@@ -58,7 +58,18 @@ func (e *Engine) Snapshot(runID string) (*WorkflowRun, error) {
 
 func (e *Engine) Claim(runID, nodeID, commandID string) (Lease, error) {
 	if e.store.CommandApplied(runID, commandID) {
-		return e.activeLease(runID, nodeID)
+		event, found, err := e.replayed(runID, commandID, func(event Event) bool {
+			return event.Type == EventNodeClaimed && event.NodeID == nodeID
+		})
+		if err != nil {
+			return Lease{}, err
+		}
+		if !found {
+			// Events written before command IDs were recorded.
+			return e.activeLease(runID, nodeID)
+		}
+		// Return the lease this command created, never a newer attempt's lease.
+		return Lease{RunID: runID, NodeID: event.NodeID, AttemptID: event.AttemptID, Attempt: event.Attempt, Fence: event.Fence}, nil
 	}
 
 	run, err := e.Snapshot(runID)
@@ -97,7 +108,7 @@ func (e *Engine) Claim(runID, nodeID, commandID string) (Lease, error) {
 
 func (e *Engine) ReportTaskSucceeded(lease Lease, commandID string) error {
 	if e.store.CommandApplied(lease.RunID, commandID) {
-		return nil
+		return e.replayedForLease(lease, commandID, EventTaskResultAccepted)
 	}
 	run, node, err := e.nodeForLease(lease)
 	if err != nil {
@@ -123,7 +134,7 @@ func (e *Engine) ReportTaskSucceeded(lease Lease, commandID string) error {
 // node's execution state.
 func (e *Engine) ReportProgress(lease Lease, commandID string) error {
 	if e.store.CommandApplied(lease.RunID, commandID) {
-		return nil
+		return e.replayedForLease(lease, commandID, EventAttemptProgressed)
 	}
 	run, node, err := e.nodeForLease(lease)
 	if err != nil {
@@ -148,7 +159,7 @@ func (e *Engine) ReportProgress(lease Lease, commandID string) error {
 // verifying and routes through the node's bounded retry policy.
 func (e *Engine) FailAttempt(lease Lease, failure FailureClass, commandID string) error {
 	if e.store.CommandApplied(lease.RunID, commandID) {
-		return nil
+		return e.replayedForLease(lease, commandID, EventAttemptFailed)
 	}
 	if failure == "" {
 		failure = FailureUnclassified
@@ -174,7 +185,11 @@ func (e *Engine) FailAttempt(lease Lease, failure FailureClass, commandID string
 
 func (e *Engine) Verify(lease Lease, passed bool, failure FailureClass, commandID string) error {
 	if e.store.CommandApplied(lease.RunID, commandID) {
-		return nil
+		eventType := EventVerificationRejected
+		if passed {
+			eventType = EventVerificationPassed
+		}
+		return e.replayedForLease(lease, commandID, eventType)
 	}
 	run, node, err := e.nodeForLease(lease)
 	if err != nil {
@@ -208,7 +223,11 @@ func (e *Engine) Verify(lease Lease, passed bool, failure FailureClass, commandI
 // target cannot resume until the inserted gate succeeds.
 func (e *Engine) AddNodeBefore(runID, targetNodeID string, spec NodeSpec, commandID string) error {
 	if e.store.CommandApplied(runID, commandID) {
-		return nil
+		_, _, err := e.replayed(runID, commandID, func(event Event) bool {
+			return event.Type == EventNodeInserted && event.NodeSpec != nil &&
+				event.NodeSpec.ID == spec.ID && event.BeforeNodeID == targetNodeID
+		})
+		return err
 	}
 	run, err := e.Snapshot(runID)
 	if err != nil {
@@ -246,6 +265,30 @@ func (e *Engine) AddNodeBefore(runID, targetNodeID string, spec NodeSpec, comman
 
 func (e *Engine) Events(runID string) []Event {
 	return e.store.Events(runID)
+}
+
+// replayed finds the event produced by an already-applied command. A command
+// whose event does not describe the same operation is a conflict; found is
+// false only for streams written before events carried their command ID.
+func (e *Engine) replayed(runID, commandID string, matches func(Event) bool) (Event, bool, error) {
+	for _, event := range e.store.Events(runID) {
+		if event.CommandID != commandID {
+			continue
+		}
+		if !matches(event) {
+			return Event{}, true, fmt.Errorf("%w: %q", ErrCommandConflict, commandID)
+		}
+		return event, true, nil
+	}
+	return Event{}, false, nil
+}
+
+func (e *Engine) replayedForLease(lease Lease, commandID string, eventType EventType) error {
+	_, _, err := e.replayed(lease.RunID, commandID, func(event Event) bool {
+		return event.Type == eventType && event.NodeID == lease.NodeID &&
+			event.AttemptID == lease.AttemptID && event.Fence == lease.Fence
+	})
+	return err
 }
 
 func (e *Engine) activeLease(runID, nodeID string) (Lease, error) {

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -67,9 +68,23 @@ func TestWorkflowRuntimeDatabaseLoop(t *testing.T) {
 	if second.AttemptNo != 2 || second.FenceToken <= first.FenceToken {
 		t.Fatalf("second lease = %+v, want attempt 2 with a newer fence", second)
 	}
+	// A retried first claim must get its own lease back, not the newer attempt's.
+	replayed, err := runtime.ClaimNode(ctx, workspaceID, runID, "implement", "claim-implement-1", WorkflowActor{Type: "system"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed != first {
+		t.Fatalf("replayed claim = %+v, want original lease %+v", replayed, first)
+	}
+	if _, err := runtime.ClaimNode(ctx, workspaceID, runID, "deliver", "claim-implement-1", WorkflowActor{Type: "system"}); !errors.Is(err, ErrWorkflowIdempotencyConflict) {
+		t.Fatalf("claim of another node with a used key: err=%v", err)
+	}
 	secondTask := newPGUUID()
 	bindSyntheticAttempt(t, ctx, queries, workspaceID, second, secondTask)
 	settleSuccess(t, ctx, pool, runtime, secondTask, `{"commit":"fixed","tests":"passed"}`)
+	if _, err := runtime.Verify(ctx, VerificationInput{WorkspaceID: workspaceID, RunID: runID, AttemptID: second.AttemptID, FenceToken: second.FenceToken, Passed: true, VerifierKind: "human", VerifierID: verifierID, IdempotencyKey: "verify-implement-1"}); !errors.Is(err, ErrWorkflowIdempotencyConflict) {
+		t.Fatalf("verification reusing another attempt's key: err=%v", err)
+	}
 	if _, err := runtime.Verify(ctx, VerificationInput{WorkspaceID: workspaceID, RunID: runID, AttemptID: second.AttemptID, FenceToken: second.FenceToken, Passed: true, VerifierKind: "human", VerifierID: verifierID, IdempotencyKey: "verify-implement-2"}); err != nil {
 		t.Fatal(err)
 	}
